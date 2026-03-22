@@ -113,6 +113,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new("huge.log");
     let mut doc = Document::open(path)?;
 
+    println!(
+        "lines: {} ({})",
+        doc.display_line_count(),
+        if doc.is_line_count_exact() { "exact" } else { "estimated" }
+    );
+
     let visible = doc.line_slice(10, 0, 160);
     println!("exact: {}", visible.is_exact());
     println!("{}", visible.text());

@@ -2815,6 +2815,16 @@ impl Document {
         }
     }
 
+    /// Returns the current best-effort line count for viewport sizing and scrolling.
+    pub fn display_line_count(&self) -> usize {
+        self.line_count().display_rows()
+    }
+
+    /// Returns `true` when [`Document::line_count`] is already exact.
+    pub fn is_line_count_exact(&self) -> bool {
+        self.line_count().is_exact()
+    }
+
     /// Returns the current document length in bytes.
     pub fn file_len(&self) -> usize {
         if let Some(piece_table) = &self.piece_table {
@@ -2850,7 +2860,7 @@ impl Document {
         Lines {
             doc: self,
             next_line: 0,
-            total_lines: self.line_count().display_rows(),
+            total_lines: self.display_line_count(),
         }
     }
 
@@ -4932,6 +4942,19 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn display_line_count_helpers_follow_exactness() {
+        let mut doc = Document::new();
+        assert_eq!(doc.display_line_count(), 1);
+        assert!(doc.is_line_count_exact());
+
+        let _ = doc.try_insert_text_at(0, 0, "one\ntwo").unwrap();
+
+        assert_eq!(doc.display_line_count(), 2);
+        assert!(doc.is_line_count_exact());
+        assert_eq!(doc.line_count(), LineCount::Exact(2));
     }
 
     proptest! {
