@@ -519,7 +519,7 @@ fn source_metadata(path: &Path) -> io::Result<IndexMetadata> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileHeader, ReadyDiskLineIndex, build_index_file, sidecar_path, source_metadata};
+    use super::{build_index_file, sidecar_path, source_metadata, FileHeader, ReadyDiskLineIndex};
     use crate::storage::FileStorage;
     use std::fs;
 

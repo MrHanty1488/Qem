@@ -2,8 +2,8 @@ use memmap2::Mmap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(not(windows))]
@@ -581,7 +581,7 @@ fn qem_temp_tag(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileStorage, qem_temp_prefix};
+    use super::{qem_temp_prefix, FileStorage};
     use std::fs;
     #[cfg(windows)]
     use std::fs::OpenOptions;

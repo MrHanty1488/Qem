@@ -4,13 +4,13 @@ use std::io::{self, Write};
 use std::iter::FusedIterator;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock, mpsc};
+use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use super::storage::{FileStorage, StorageOpenError};
 use crate::index::DiskLineIndex;
-use crate::piece_tree::{Piece, PieceSource, PieceTree, SessionMeta, editlog_path};
+use crate::piece_tree::{editlog_path, Piece, PieceSource, PieceTree, SessionMeta};
 
 // Hard limits to keep mmap indexing bounded for huge files.
 // We still fully index "reasonable" files (Notepad++-style), but cap the work for truly huge inputs.
@@ -3847,13 +3847,11 @@ mod tests {
 
         assert_eq!((line0, col0), (0, 4));
         assert_eq!(piece_table.to_string_lossy(), "abcZ");
-        assert!(
-            piece_table
-                .pieces
-                .to_vec()
-                .iter()
-                .all(|piece| piece.len > 0)
-        );
+        assert!(piece_table
+            .pieces
+            .to_vec()
+            .iter()
+            .all(|piece| piece.len > 0));
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3892,11 +3890,9 @@ mod tests {
         doc.save_to(&dst).unwrap();
 
         assert_eq!((line0, col0), (1, 1));
-        assert!(
-            std::fs::read(&dst)
-                .unwrap()
-                .starts_with(b"alpha\r\nX\r\nbeta\r\n")
-        );
+        assert!(std::fs::read(&dst)
+            .unwrap()
+            .starts_with(b"alpha\r\nX\r\nbeta\r\n"));
 
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_file(&dst);

@@ -1,7 +1,7 @@
 [package]
 name = "qem"
 version = "0.2.0"
-edition = "2024"
+edition = "2021"
 rust-version = "1.85"
 description = "High-performance cross-platform text engine for massive files."
 license = "MIT OR Apache-2.0"

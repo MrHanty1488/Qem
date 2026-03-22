@@ -1487,7 +1487,7 @@ fn coalesce_adjacent(pieces: &mut Vec<Piece>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Piece, PieceSource, PieceTree, SessionMeta, editlog_path};
+    use super::{editlog_path, Piece, PieceSource, PieceTree, SessionMeta};
     use std::fs;
 
     fn collect(tree: &PieceTree) -> Vec<(PieceSource, usize, usize, usize)> {
