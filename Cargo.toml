@@ -14,8 +14,6 @@ categories = ["text-processing", "filesystem", "data-structures"]
 include = [
     "Cargo.toml",
     "README.md",
-    "CHANGELOG.md",
-    "RELEASE.md",
     "LICENSE",
     "LICENSE-APACHE",
     "src/**/*",
