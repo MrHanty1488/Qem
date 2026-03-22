@@ -582,9 +582,11 @@ fn qem_temp_tag(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{FileStorage, qem_temp_prefix};
-    use std::fs::{self, OpenOptions};
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(windows)]
+    use std::fs::OpenOptions;
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
