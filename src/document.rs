@@ -33,6 +33,7 @@ const TAIL_FAST_PATH_MAX_BACKSCAN_BYTES: usize = 1024 * 1024; // 1 MiB
 const FALLBACK_NEXT_LINE_SCAN_BYTES: usize = 1024 * 1024; // 1 MiB
 const SAVE_STREAM_CHUNK_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 const MAX_ROPE_EDIT_FILE_BYTES: usize = 128 * 1024 * 1024; // 128 MiB safety cap for full materialization
+const FULL_SYNC_PIECE_TABLE_MAX_FILE_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 const PIECE_TREE_TARGET_BYTES: usize = 64 * 1024;
 const PIECE_TREE_TARGET_LINES: usize = 512;
 const PIECE_TREE_DISK_MIN_BYTES: usize = PIECE_TABLE_MIN_BYTES;
@@ -234,7 +235,6 @@ fn prefix_line_lengths_from_offsets(offsets: &LineOffsets, max_lines: usize) -> 
     lengths
 }
 
-#[cfg(test)]
 fn line_lengths_from_bytes(bytes: &[u8], max_lines: usize) -> Option<Vec<usize>> {
     if bytes.is_empty() {
         return Some(vec![0]);
@@ -1979,6 +1979,37 @@ impl LineSlice {
     }
 }
 
+/// Total document line count, represented either as an exact value or as a
+/// scrolling estimate while background indexing is still incomplete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum LineCount {
+    Exact(usize),
+    Estimated(usize),
+}
+
+impl LineCount {
+    /// Returns the exact line count when it is known.
+    pub fn exact(self) -> Option<usize> {
+        match self {
+            Self::Exact(lines) => Some(lines),
+            Self::Estimated(_) => None,
+        }
+    }
+
+    /// Returns the value that should be used for viewport sizing and scrolling.
+    pub fn display_rows(self) -> usize {
+        match self {
+            Self::Exact(lines) | Self::Estimated(lines) => lines.max(1),
+        }
+    }
+
+    /// Returns `true` when the total line count is exact.
+    pub fn is_exact(self) -> bool {
+        matches!(self, Self::Exact(_))
+    }
+}
+
 struct Lines<'a> {
     doc: &'a Document,
     next_line: usize,
@@ -2254,7 +2285,11 @@ impl Document {
                 }
                 indexed_bytes_scanner.store(scanned, Ordering::Relaxed);
                 let lines = newlines_found.saturating_add(1).max(1);
-                let final_avg = scanned.div_ceil(lines).max(1);
+                let final_avg = if scanned == 0 {
+                    avg_line_len_scanner.load(Ordering::Relaxed).max(1)
+                } else {
+                    scanned.div_ceil(lines).max(1)
+                };
                 avg_line_len_scanner.store(final_avg, Ordering::Relaxed);
                 if !buf.is_empty() {
                     let _ = tx.send(OffsetsChunk::U32(buf));
@@ -2312,7 +2347,11 @@ impl Document {
                 }
                 indexed_bytes_scanner.store(scanned, Ordering::Relaxed);
                 let lines = newlines_found.saturating_add(1).max(1);
-                let final_avg = scanned.div_ceil(lines).max(1);
+                let final_avg = if scanned == 0 {
+                    avg_line_len_scanner.load(Ordering::Relaxed).max(1)
+                } else {
+                    scanned.div_ceil(lines).max(1)
+                };
                 avg_line_len_scanner.store(final_avg, Ordering::Relaxed);
                 if !buf.is_empty() {
                     let _ = tx.send(OffsetsChunk::U64(buf));
@@ -2624,13 +2663,8 @@ impl Document {
         storage.read_range(0, storage.len())
     }
 
-    /// Returns the exact line count when known, otherwise a safe lower bound.
-    pub fn line_count(&self) -> usize {
-        self.bounded_line_count().max(1)
-    }
-
     /// Returns the line count without heuristic extrapolation from average line length.
-    pub fn bounded_line_count(&self) -> usize {
+    fn bounded_line_count(&self) -> usize {
         if let Some(piece_table) = &self.piece_table {
             return piece_table.line_count().max(1);
         }
@@ -2648,9 +2682,9 @@ impl Document {
     }
 
     /// Returns an estimated line count that is useful while background indexing is in progress.
-    pub fn estimated_line_count(&self) -> usize {
+    fn estimated_line_count_value(&self) -> usize {
         if self.has_precise_line_lengths() {
-            return self.line_count().max(1);
+            return self.exact_line_count().unwrap_or(1);
         }
         if let Some(total_lines) = self.disk_index_total_lines() {
             return total_lines.max(1);
@@ -2673,6 +2707,39 @@ impl Document {
             .unwrap_or(1);
 
         estimate.max(offsets_rows).max(piece_rows)
+    }
+
+    fn exact_line_count_value(&self) -> Option<usize> {
+        if let Some(piece_table) = &self.piece_table
+            && piece_table.full_index()
+        {
+            return Some(piece_table.line_count().max(1));
+        }
+        if let Some(rope) = &self.rope {
+            return Some(rope.len_lines().max(1));
+        }
+        if let Some(total_lines) = self.disk_index_total_lines() {
+            return Some(total_lines.max(1));
+        }
+        if self.is_fully_indexed() {
+            return Some(self.bounded_line_count().max(1));
+        }
+        None
+    }
+
+    /// Returns the exact document line count when it is known.
+    pub fn exact_line_count(&self) -> Option<usize> {
+        self.exact_line_count_value()
+    }
+
+    /// Returns the current document line count, explicitly distinguishing exact
+    /// values from scrolling estimates.
+    pub fn line_count(&self) -> LineCount {
+        if let Some(lines) = self.exact_line_count_value() {
+            LineCount::Exact(lines)
+        } else {
+            LineCount::Estimated(self.estimated_line_count_value())
+        }
     }
 
     /// Returns the current document length in bytes.
@@ -2710,7 +2777,7 @@ impl Document {
         Lines {
             doc: self,
             next_line: 0,
-            total_lines: self.line_count(),
+            total_lines: self.line_count().display_rows(),
         }
     }
 
@@ -2849,7 +2916,7 @@ impl Document {
 
         let indexing_complete = self.is_fully_indexed();
         if !indexing_complete {
-            let estimated_total = self.estimated_line_count().max(1);
+            let estimated_total = self.estimated_line_count_value().max(1);
             let requested_end = first_line0.saturating_add(line_count);
             let tail_trigger = estimated_total.saturating_sub(line_count.saturating_mul(2).max(32));
             if requested_end >= tail_trigger {
@@ -2949,6 +3016,13 @@ impl Document {
         }
 
         let storage = self.storage.as_ref()?;
+        if !indexed_complete
+            && self.file_len <= FULL_SYNC_PIECE_TABLE_MAX_FILE_BYTES
+            && let Some(line_lengths) =
+                line_lengths_from_bytes(storage.bytes(), LINE_LENGTHS_MAX_SYNC_LINES)
+        {
+            return Some((line_lengths, true));
+        }
         let required_lines = line0
             .saturating_add(1)
             .clamp(
@@ -3518,7 +3592,7 @@ mod tests {
         };
 
         let (line_lengths, full_index) = doc.piece_table_line_lengths_for_edit(0).unwrap();
-        assert!(!full_index);
+        assert!(full_index);
         assert_eq!(line_lengths, vec![6, 5, 6, 0]);
 
         let _ = std::fs::remove_file(&path);
@@ -3640,6 +3714,53 @@ mod tests {
         assert!(doc.piece_table.is_some());
         assert!(doc.rope.is_none());
         assert!(doc.text_lossy().starts_with("Xabc\ndef\n"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn insert_fully_indexes_medium_unindexed_piece_table_documents() {
+        let dir = std::env::temp_dir().join(format!(
+            "standpad-doc-insert-full-piece-table-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("insert-full.txt");
+
+        let mut original = String::new();
+        for i in 0..300_000usize {
+            use std::fmt::Write as _;
+            let _ = writeln!(&mut original, "L{i:06}");
+        }
+        std::fs::write(&path, original).unwrap();
+        let storage = FileStorage::open(&path).unwrap();
+
+        let mut doc = Document {
+            path: Some(path.clone()),
+            storage: Some(storage),
+            line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+            disk_index: None,
+            indexing: Arc::new(AtomicBool::new(true)),
+            indexing_started: None,
+            file_len: std::fs::metadata(&path).unwrap().len() as usize,
+            indexed_bytes: Arc::new(AtomicUsize::new(0)),
+            avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+            line_ending: LineEnding::Lf,
+            rope: None,
+            piece_table: None,
+            dirty: false,
+        };
+
+        let (line0, col0) = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+        let slice = doc.line_slice(5_000, 0, 16);
+
+        assert_eq!((line0, col0), (1, 0));
+        assert!(doc.piece_table.is_some());
+        assert!(doc.has_precise_line_lengths());
+        assert_eq!(doc.exact_line_count(), Some(300_002));
+        assert!(slice.is_exact());
+        assert_eq!(slice.text(), "L004999");
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3932,8 +4053,8 @@ mod tests {
 
         assert!(doc.is_fully_indexed());
         assert!(doc.has_precise_line_lengths());
-        assert_eq!(doc.estimated_line_count(), doc.line_count());
-        assert_eq!(doc.line_count(), 10_001);
+        assert_eq!(doc.line_count(), LineCount::Exact(10_001));
+        assert_eq!(doc.exact_line_count(), Some(10_001));
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4289,7 +4410,7 @@ mod tests {
             doc.indexed_bytes(),
             std::fs::metadata(&path).unwrap().len() as usize
         );
-        assert_eq!(doc.line_count(), 4);
+        assert_eq!(doc.line_count(), LineCount::Exact(4));
         assert_eq!(doc.line_slice(2, 0, 16).text(), "two");
 
         let _ = std::fs::remove_file(&path);

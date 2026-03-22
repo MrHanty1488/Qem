@@ -1,4 +1,5 @@
 use qem::Document;
+use qem::LineCount;
 use std::env;
 use std::path::PathBuf;
 use std::thread;
@@ -26,8 +27,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("path: {}", path.display());
-    println!("estimated_lines: {}", doc.estimated_line_count());
-    println!("precise_lines: {}", doc.line_count());
+    match doc.line_count() {
+        LineCount::Exact(lines) => println!("lines: {lines} (exact)"),
+        LineCount::Estimated(lines) => println!("lines: {lines} (estimated)"),
+    }
 
     for (offset, slice) in doc
         .line_slices(start_line0, line_count, 0, 160)

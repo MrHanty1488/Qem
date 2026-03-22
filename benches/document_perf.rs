@@ -116,7 +116,7 @@ fn bench_open(c: &mut Criterion) {
             for _ in 0..iters {
                 let doc = Document::open(&fixture.path).expect("open bench document");
                 wait_for_indexing(&doc, Duration::from_secs(20));
-                black_box(doc.line_count());
+                black_box(doc.line_count().display_rows());
             }
             start.elapsed()
         });
@@ -134,7 +134,7 @@ fn bench_small_open(c: &mut Criterion) {
             let start = Instant::now();
             for _ in 0..iters {
                 let doc = Document::open(&fixture.path).expect("open small qem document");
-                black_box(doc.line_count());
+                black_box(doc.line_count().display_rows());
             }
             start.elapsed()
         });
@@ -156,7 +156,7 @@ fn bench_small_open(c: &mut Criterion) {
 fn bench_scroll(c: &mut Criterion) {
     let fixture = scroll_fixture();
     let doc = open_and_wait(&fixture.path);
-    let line_count = doc.line_count().max(VIEWPORT_LINES);
+    let line_count = doc.line_count().display_rows().max(VIEWPORT_LINES);
     let middle_line = line_count / 2;
     let tail_line = line_count.saturating_sub(VIEWPORT_LINES);
 

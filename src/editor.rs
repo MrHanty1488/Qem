@@ -610,7 +610,7 @@ mod tests {
         assert_eq!(tab.cursor().line(), 1);
         assert_eq!(tab.cursor().column(), 1);
         assert_eq!(tab.current_path(), Some(path.as_path()));
-        assert_eq!(tab.document().line_count(), 3);
+        assert_eq!(tab.document().exact_line_count(), Some(3));
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir_all(&dir);

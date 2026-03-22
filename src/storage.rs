@@ -72,6 +72,7 @@ struct StorageInner {
 #[derive(Debug)]
 enum StorageBacking {
     Empty,
+    #[cfg(windows)]
     Mapped {
         _file: File,
         mmap: Mmap,
@@ -112,6 +113,7 @@ impl StorageInner {
     fn bytes(&self) -> &[u8] {
         match &self.backing {
             StorageBacking::Empty => &[],
+            #[cfg(windows)]
             StorageBacking::Mapped { mmap, .. } => &mmap[..],
             #[cfg(not(windows))]
             StorageBacking::Snapshot { mapping } => mapping.bytes(),
