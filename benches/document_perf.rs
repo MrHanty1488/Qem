@@ -1,7 +1,9 @@
 use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
-use qem::{Document, LiteralSearchQuery, TextPosition, TextSelection, ViewportRequest};
+use qem::{
+    CompactionPolicy, Document, LiteralSearchQuery, TextPosition, TextSelection, ViewportRequest,
+};
 #[cfg(feature = "editor")]
 use qem::{DocumentSession, EditorTab};
 use ropey::Rope;
@@ -22,6 +24,8 @@ const SAVE_LINE_COUNT: usize = 250_000;
 const PIECE_TABLE_EDIT_LINE_COUNT: usize = 64_000;
 const TYPED_EDIT_LINE_COUNT: usize = 4_096;
 const LONG_LINE_WIDTH: usize = 96;
+const DENSE_SEARCH_RANGE_LINES: usize = 2_048;
+const DENSE_SEARCH_ITER_LIMIT: usize = 512;
 
 #[derive(Clone, Debug)]
 struct Fixture {
@@ -154,6 +158,58 @@ fn open_tab_and_wait(path: &Path) -> EditorTab {
     tab
 }
 
+#[cfg(feature = "editor")]
+#[derive(Debug)]
+struct SessionPieceTableCase {
+    _dir: TempDir,
+    session: DocumentSession,
+}
+
+#[cfg(feature = "editor")]
+fn build_fragmented_session_case(fixture: &Fixture) -> SessionPieceTableCase {
+    let dir = tempfile::tempdir().expect("create session maintenance temp dir");
+    let path = dir.path().join("session-piece-table.log");
+    fs::copy(&fixture.path, &path).expect("copy session maintenance fixture");
+    let mut session = open_session_and_wait(&path);
+    let _ = session
+        .try_insert(TextPosition::new(0, 0), "[qem-piece-table]\n")
+        .expect("seed session maintenance document");
+    for i in 0..512usize {
+        let line0 = (i * 7) % 2048;
+        let col0 = (i % 5) + 1;
+        let _ = session
+            .try_insert(TextPosition::new(line0, col0), "x")
+            .expect("fragment session maintenance document");
+    }
+    SessionPieceTableCase { _dir: dir, session }
+}
+
+#[cfg(feature = "editor")]
+#[derive(Debug)]
+struct TabPieceTableCase {
+    _dir: TempDir,
+    tab: EditorTab,
+}
+
+#[cfg(feature = "editor")]
+fn build_fragmented_tab_case(fixture: &Fixture) -> TabPieceTableCase {
+    let dir = tempfile::tempdir().expect("create tab maintenance temp dir");
+    let path = dir.path().join("tab-piece-table.log");
+    fs::copy(&fixture.path, &path).expect("copy tab maintenance fixture");
+    let mut tab = open_tab_and_wait(&path);
+    let _ = tab
+        .try_insert(TextPosition::new(0, 0), "[qem-piece-table]\n")
+        .expect("seed tab maintenance document");
+    for i in 0..512usize {
+        let line0 = (i * 7) % 2048;
+        let col0 = (i % 5) + 1;
+        let _ = tab
+            .try_insert(TextPosition::new(line0, col0), "x")
+            .expect("fragment tab maintenance document");
+    }
+    TabPieceTableCase { _dir: dir, tab }
+}
+
 fn bench_open(c: &mut Criterion) {
     let fixture = open_fixture();
     let mut group = c.benchmark_group("document_open");
@@ -283,6 +339,56 @@ fn bench_session_layer_reads(c: &mut Criterion) {
         b.iter(|| black_box(tab.status()))
     });
     status_group.finish();
+
+    let maintenance_fixture = piece_table_edit_fixture();
+    let maintenance_policy = CompactionPolicy {
+        min_total_bytes: 0,
+        min_piece_count: 2,
+        small_piece_threshold_bytes: usize::MAX,
+        max_average_piece_bytes: usize::MAX,
+        min_fragmentation_ratio: 0.0,
+        forced_piece_count: usize::MAX,
+        forced_fragmentation_ratio: 1.0,
+    };
+    let maintenance_doc = build_fragmented_piece_table_case(maintenance_fixture);
+    let maintenance_session = build_fragmented_session_case(maintenance_fixture);
+    let maintenance_tab = build_fragmented_tab_case(maintenance_fixture);
+
+    let mut maintenance_group = c.benchmark_group("session_layer_maintenance_status");
+    maintenance_group.bench_function(
+        BenchmarkId::new("document", maintenance_fixture.label),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    maintenance_doc
+                        .doc
+                        .maintenance_status_with_policy(maintenance_policy),
+                )
+            })
+        },
+    );
+    maintenance_group.bench_function(
+        BenchmarkId::new("session", maintenance_fixture.label),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    maintenance_session
+                        .session
+                        .maintenance_status_with_policy(maintenance_policy),
+                )
+            })
+        },
+    );
+    maintenance_group.bench_function(BenchmarkId::new("tab", maintenance_fixture.label), |b| {
+        b.iter(|| {
+            black_box(
+                maintenance_tab
+                    .tab
+                    .maintenance_status_with_policy(maintenance_policy),
+            )
+        })
+    });
+    maintenance_group.finish();
 }
 
 #[cfg(not(feature = "editor"))]
@@ -320,6 +426,19 @@ fn build_piece_table_edit_case(fixture: &Fixture) -> PieceTableEditCase {
         .try_insert(TextPosition::new(0, 0), "[qem-piece-table]\n")
         .expect("seed piece-table edit document");
     PieceTableEditCase { _dir: dir, doc }
+}
+
+fn build_fragmented_piece_table_case(fixture: &Fixture) -> PieceTableEditCase {
+    let mut case = build_piece_table_edit_case(fixture);
+    for i in 0..512usize {
+        let line0 = (i * 7) % 2048;
+        let col0 = (i % 5) + 1;
+        let _ = case
+            .doc
+            .try_insert(TextPosition::new(line0, col0), "x")
+            .expect("seed fragmented piece-table bench document");
+    }
+    case
 }
 
 fn typed_read_selection(line0: usize) -> TextSelection {
@@ -363,11 +482,35 @@ fn bench_literal_search(c: &mut Criterion) {
     let piece_table_fixture = piece_table_edit_fixture();
     let mmap_doc = open_and_wait(&mmap_fixture.path);
     let piece_table_case = build_piece_table_edit_case(piece_table_fixture);
+    let fragmented_piece_table_case = build_fragmented_piece_table_case(piece_table_fixture);
     let mmap_needle = format!("{:08}", SCROLL_LINE_COUNT / 2);
     let piece_table_needle = format!("{:08}", PIECE_TABLE_EDIT_LINE_COUNT / 2);
+    let piece_table_missing_needle = "__qem_missing_literal__";
+    let piece_table_many_match_needle = "00";
+    let piece_table_from_middle = TextPosition::new(PIECE_TABLE_EDIT_LINE_COUNT / 2, 0);
+    let piece_table_before_middle = TextPosition::new(PIECE_TABLE_EDIT_LINE_COUNT / 2 + 1, 0);
+    let dense_range_start_line = PIECE_TABLE_EDIT_LINE_COUNT / 2;
+    let piece_table_dense_selection = TextSelection::new(
+        TextPosition::new(dense_range_start_line, 0),
+        TextPosition::new(
+            (dense_range_start_line + DENSE_SEARCH_RANGE_LINES).min(PIECE_TABLE_EDIT_LINE_COUNT),
+            0,
+        ),
+    );
+    let piece_table_dense_range = piece_table_case
+        .doc
+        .text_range_for_selection(piece_table_dense_selection);
+    let fragmented_piece_table_dense_range = fragmented_piece_table_case
+        .doc
+        .text_range_for_selection(piece_table_dense_selection);
     let mmap_query = LiteralSearchQuery::new(mmap_needle.clone()).expect("build mmap search query");
+    let dense_query = LiteralSearchQuery::new("00").expect("build dense search query");
     let piece_table_query = LiteralSearchQuery::new(piece_table_needle.clone())
         .expect("build piece-table search query");
+    let piece_table_missing_query = LiteralSearchQuery::new(piece_table_missing_needle)
+        .expect("build missing piece-table search query");
+    let piece_table_many_match_query = LiteralSearchQuery::new(piece_table_many_match_needle)
+        .expect("build many-match piece-table search query");
 
     let mut group = c.benchmark_group("literal_search");
     group.bench_function(
@@ -411,6 +554,35 @@ fn bench_literal_search(c: &mut Criterion) {
         },
     );
     group.bench_function(
+        BenchmarkId::new("mmap_find_all_dense_match_first_512", mmap_fixture.label),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    mmap_doc
+                        .find_all("00")
+                        .take(DENSE_SEARCH_ITER_LIMIT)
+                        .count(),
+                )
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "mmap_query_find_all_dense_match_first_512",
+            mmap_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    mmap_doc
+                        .find_all_query(&dense_query)
+                        .take(DENSE_SEARCH_ITER_LIMIT)
+                        .count(),
+                )
+            })
+        },
+    );
+    group.bench_function(
         BenchmarkId::new("piece_table_find_next", piece_table_fixture.label),
         |b| {
             b.iter(|| {
@@ -445,6 +617,20 @@ fn bench_literal_search(c: &mut Criterion) {
         },
     );
     group.bench_function(
+        BenchmarkId::new(
+            "piece_table_query_find_next_from_middle",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(piece_table_case.doc.find_next_query(
+                    black_box(&piece_table_query),
+                    black_box(piece_table_from_middle),
+                ))
+            })
+        },
+    );
+    group.bench_function(
         BenchmarkId::new("piece_table_query_find_prev", piece_table_fixture.label),
         |b| {
             b.iter(|| {
@@ -452,6 +638,269 @@ fn bench_literal_search(c: &mut Criterion) {
                     black_box(&piece_table_query),
                     TextPosition::new(usize::MAX, usize::MAX),
                 ))
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "piece_table_query_find_next_no_match",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(piece_table_case.doc.find_next_query(
+                    black_box(&piece_table_missing_query),
+                    TextPosition::new(0, 0),
+                ))
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "piece_table_query_find_prev_no_match",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(piece_table_case.doc.find_prev_query(
+                    black_box(&piece_table_missing_query),
+                    TextPosition::new(usize::MAX, usize::MAX),
+                ))
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "piece_table_query_find_next_many_match",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(piece_table_case.doc.find_next_query(
+                    black_box(&piece_table_many_match_query),
+                    TextPosition::new(0, 0),
+                ))
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "piece_table_query_find_prev_many_match",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(piece_table_case.doc.find_prev_query(
+                    black_box(&piece_table_many_match_query),
+                    TextPosition::new(usize::MAX, usize::MAX),
+                ))
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "piece_table_find_all_dense_match_first_512",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    piece_table_case
+                        .doc
+                        .find_all("00")
+                        .take(DENSE_SEARCH_ITER_LIMIT)
+                        .count(),
+                )
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "piece_table_query_find_all_dense_match_first_512",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    piece_table_case
+                        .doc
+                        .find_all_query(&dense_query)
+                        .take(DENSE_SEARCH_ITER_LIMIT)
+                        .count(),
+                )
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "piece_table_find_all_in_range_dense_match_first_512",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    piece_table_case
+                        .doc
+                        .find_all_in_range("00", piece_table_dense_range)
+                        .take(DENSE_SEARCH_ITER_LIMIT)
+                        .count(),
+                )
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "piece_table_query_find_all_in_range_dense_match_first_512",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    piece_table_case
+                        .doc
+                        .find_all_query_in_range(&dense_query, piece_table_dense_range)
+                        .take(DENSE_SEARCH_ITER_LIMIT)
+                        .count(),
+                )
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "piece_table_query_find_prev_from_middle",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(piece_table_case.doc.find_prev_query(
+                    black_box(&piece_table_query),
+                    black_box(piece_table_before_middle),
+                ))
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "fragmented_piece_table_query_find_next",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    fragmented_piece_table_case
+                        .doc
+                        .find_next_query(black_box(&piece_table_query), TextPosition::new(0, 0)),
+                )
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "fragmented_piece_table_query_find_next_from_middle",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(fragmented_piece_table_case.doc.find_next_query(
+                    black_box(&piece_table_query),
+                    black_box(piece_table_from_middle),
+                ))
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "fragmented_piece_table_query_find_next_no_match",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(fragmented_piece_table_case.doc.find_next_query(
+                    black_box(&piece_table_missing_query),
+                    TextPosition::new(0, 0),
+                ))
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "fragmented_piece_table_query_find_prev_from_middle",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(fragmented_piece_table_case.doc.find_prev_query(
+                    black_box(&piece_table_query),
+                    black_box(piece_table_before_middle),
+                ))
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "fragmented_piece_table_find_all_dense_match_first_512",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    fragmented_piece_table_case
+                        .doc
+                        .find_all("00")
+                        .take(DENSE_SEARCH_ITER_LIMIT)
+                        .count(),
+                )
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "fragmented_piece_table_query_find_all_dense_match_first_512",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    fragmented_piece_table_case
+                        .doc
+                        .find_all_query(&dense_query)
+                        .take(DENSE_SEARCH_ITER_LIMIT)
+                        .count(),
+                )
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "fragmented_piece_table_find_all_in_range_dense_match_first_512",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    fragmented_piece_table_case
+                        .doc
+                        .find_all_in_range("00", fragmented_piece_table_dense_range)
+                        .take(DENSE_SEARCH_ITER_LIMIT)
+                        .count(),
+                )
+            })
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(
+            "fragmented_piece_table_query_find_all_in_range_dense_match_first_512",
+            piece_table_fixture.label,
+        ),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    fragmented_piece_table_case
+                        .doc
+                        .find_all_query_in_range(&dense_query, fragmented_piece_table_dense_range)
+                        .take(DENSE_SEARCH_ITER_LIMIT)
+                        .count(),
+                )
             })
         },
     );
@@ -578,6 +1027,39 @@ fn bench_typed_edits(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_piece_table_compaction(c: &mut Criterion) {
+    let fixture = piece_table_edit_fixture();
+    let mut group = c.benchmark_group("piece_table_compaction");
+    group.sample_size(10);
+    group.bench_function(
+        BenchmarkId::new("compact_current_state", fixture.label),
+        |b| {
+            b.iter_batched(
+                || build_fragmented_piece_table_case(fixture),
+                |mut case| {
+                    let before = case
+                        .doc
+                        .fragmentation_stats_with_threshold(1)
+                        .expect("fragmentation stats before compaction")
+                        .piece_count();
+                    let compacted = case
+                        .doc
+                        .compact_piece_table()
+                        .expect("compact fragmented piece-table bench document");
+                    let after = case
+                        .doc
+                        .fragmentation_stats_with_threshold(1)
+                        .expect("fragmentation stats after compaction")
+                        .piece_count();
+                    black_box((before, compacted, after));
+                },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+    group.finish();
+}
+
 fn bench_edited_scroll(c: &mut Criterion) {
     let fixture = scroll_fixture();
     let case = build_edited_document_case(fixture);
@@ -641,6 +1123,6 @@ criterion_group! {
         .warm_up_time(Duration::from_millis(500))
         .measurement_time(Duration::from_secs(3))
         .sample_size(10);
-    targets = bench_small_open, bench_open, bench_scroll, bench_session_layer_reads, bench_edited_scroll, bench_typed_reads, bench_literal_search, bench_text_materialization, bench_typed_edits, bench_save
+    targets = bench_small_open, bench_open, bench_scroll, bench_session_layer_reads, bench_edited_scroll, bench_typed_reads, bench_literal_search, bench_text_materialization, bench_typed_edits, bench_piece_table_compaction, bench_save
 }
 criterion_main!(benches);

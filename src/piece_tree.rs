@@ -20,6 +20,7 @@ const EDITLOG_CACHE_PAGES: usize = 1024;
 const LEAF_ENTRY_BYTES: usize = 32;
 const INTERNAL_ENTRY_BYTES: usize = 24;
 const HISTORY_ENTRY_BYTES: usize = 32;
+const DEFAULT_FRAGMENTATION_SMALL_PIECE_BYTES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PieceSource {
@@ -33,6 +34,79 @@ pub(crate) struct Piece {
     pub(crate) start: usize,
     pub(crate) len: usize,
     pub(crate) line_breaks: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FragmentationStats {
+    pub(crate) piece_count: usize,
+    pub(crate) total_bytes: usize,
+    pub(crate) smallest_piece_bytes: usize,
+    pub(crate) largest_piece_bytes: usize,
+    pub(crate) small_piece_threshold_bytes: usize,
+    pub(crate) small_piece_count: usize,
+    pub(crate) small_piece_bytes: usize,
+}
+
+impl FragmentationStats {
+    pub fn piece_count(self) -> usize {
+        self.piece_count
+    }
+
+    pub fn total_bytes(self) -> usize {
+        self.total_bytes
+    }
+
+    pub fn smallest_piece_bytes(self) -> usize {
+        self.smallest_piece_bytes
+    }
+
+    pub fn largest_piece_bytes(self) -> usize {
+        self.largest_piece_bytes
+    }
+
+    pub fn small_piece_threshold_bytes(self) -> usize {
+        self.small_piece_threshold_bytes
+    }
+
+    pub fn small_piece_count(self) -> usize {
+        self.small_piece_count
+    }
+
+    pub fn small_piece_bytes(self) -> usize {
+        self.small_piece_bytes
+    }
+
+    pub fn average_piece_bytes(self) -> f64 {
+        if self.piece_count == 0 {
+            0.0
+        } else {
+            self.total_bytes as f64 / self.piece_count as f64
+        }
+    }
+
+    pub fn fragmentation_ratio(self) -> f64 {
+        if self.piece_count == 0 {
+            0.0
+        } else {
+            self.small_piece_count as f64 / self.piece_count as f64
+        }
+    }
+
+    fn observe_piece(&mut self, piece: Piece) {
+        self.piece_count = self.piece_count.saturating_add(1);
+        self.total_bytes = self.total_bytes.saturating_add(piece.len);
+        if self.piece_count == 1 {
+            self.smallest_piece_bytes = piece.len;
+            self.largest_piece_bytes = piece.len;
+        } else {
+            self.smallest_piece_bytes = self.smallest_piece_bytes.min(piece.len);
+            self.largest_piece_bytes = self.largest_piece_bytes.max(piece.len);
+        }
+        if piece.len <= self.small_piece_threshold_bytes {
+            self.small_piece_count = self.small_piece_count.saturating_add(1);
+            self.small_piece_bytes = self.small_piece_bytes.saturating_add(piece.len);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,6 +331,24 @@ impl PieceTree {
         out
     }
 
+    pub(crate) fn fragmentation_stats(&self) -> FragmentationStats {
+        self.fragmentation_stats_with_threshold(DEFAULT_FRAGMENTATION_SMALL_PIECE_BYTES)
+    }
+
+    pub(crate) fn fragmentation_stats_with_threshold(
+        &self,
+        small_piece_threshold_bytes: usize,
+    ) -> FragmentationStats {
+        let mut stats = FragmentationStats {
+            small_piece_threshold_bytes,
+            ..FragmentationStats::default()
+        };
+        if let Some(root) = self.root {
+            self.collect_fragmentation_stats(root, &mut stats);
+        }
+        stats
+    }
+
     pub(crate) fn visit_range(
         &self,
         start: usize,
@@ -273,6 +365,42 @@ impl PieceTree {
             return;
         }
         self.visit_range_ref(root, start, end, 0, &mut visit);
+    }
+
+    pub(crate) fn visit_range_while(
+        &self,
+        start: usize,
+        end: usize,
+        mut visit: impl FnMut(Piece, usize, usize) -> bool,
+    ) -> bool {
+        let Some(root) = self.root else {
+            return true;
+        };
+        let total = root.total_bytes;
+        let start = start.min(total);
+        let end = end.min(total).max(start);
+        if start >= end {
+            return true;
+        }
+        self.visit_range_ref_while(root, start, end, 0, &mut visit)
+    }
+
+    pub(crate) fn visit_range_rev_while(
+        &self,
+        start: usize,
+        end: usize,
+        mut visit: impl FnMut(Piece, usize, usize) -> bool,
+    ) -> bool {
+        let Some(root) = self.root else {
+            return true;
+        };
+        let total = root.total_bytes;
+        let start = start.min(total);
+        let end = end.min(total).max(start);
+        if start >= end {
+            return true;
+        }
+        self.visit_range_ref_rev_while(root, start, end, 0, &mut visit)
     }
 
     pub(crate) fn find_line_start(
@@ -334,6 +462,17 @@ impl PieceTree {
     pub(crate) fn flush_session(&mut self, add_bytes: &[u8], meta: SessionMeta) -> io::Result<()> {
         self.store
             .flush_session(&self.history, self.history_index, add_bytes, meta)
+    }
+
+    pub(crate) fn replace_current_root_with_pieces(&mut self, pieces: Vec<Piece>) {
+        let root = self.build_tree_from_pieces(filter_zero_len(pieces));
+        self.root = root;
+        if let Some(entry) = self.history.get_mut(self.history_index) {
+            entry.root = root;
+        } else {
+            self.history = vec![RootEntry { root }];
+            self.history_index = 0;
+        }
     }
 
     pub(crate) fn detach_persistence(&mut self) {
@@ -420,6 +559,24 @@ impl PieceTree {
         }
     }
 
+    fn collect_fragmentation_stats(&self, child: ChildRef, stats: &mut FragmentationStats) {
+        let Some(page) = self.page(child.page_id) else {
+            return;
+        };
+        match page.as_ref() {
+            PiecePage::Internal { children } => {
+                for child in children {
+                    self.collect_fragmentation_stats(*child, stats);
+                }
+            }
+            PiecePage::Leaf { pieces } => {
+                for piece in pieces {
+                    stats.observe_piece(*piece);
+                }
+            }
+        }
+    }
+
     fn visit_range_ref(
         &self,
         child: ChildRef,
@@ -467,6 +624,113 @@ impl PieceTree {
                 }
             }
         }
+    }
+
+    fn visit_range_ref_while(
+        &self,
+        child: ChildRef,
+        start: usize,
+        end: usize,
+        base: usize,
+        visit: &mut impl FnMut(Piece, usize, usize) -> bool,
+    ) -> bool {
+        let Some(page) = self.page(child.page_id) else {
+            return true;
+        };
+        match page.as_ref() {
+            PiecePage::Internal { children } => {
+                let mut child_base = base;
+                for child in children {
+                    let child_end = child_base.saturating_add(child.total_bytes);
+                    if child_end <= start {
+                        child_base = child_end;
+                        continue;
+                    }
+                    if child_base >= end {
+                        break;
+                    }
+                    if !self.visit_range_ref_while(*child, start, end, child_base, visit) {
+                        return false;
+                    }
+                    child_base = child_end;
+                }
+            }
+            PiecePage::Leaf { pieces } => {
+                let mut piece_base = base;
+                for piece in pieces {
+                    let piece_end = piece_base.saturating_add(piece.len);
+                    if piece_end <= start {
+                        piece_base = piece_end;
+                        continue;
+                    }
+                    if piece_base >= end {
+                        break;
+                    }
+                    let overlap_start = start.saturating_sub(piece_base).min(piece.len);
+                    let overlap_end = end.min(piece_end).saturating_sub(piece_base).min(piece.len);
+                    if overlap_start < overlap_end && !visit(*piece, overlap_start, overlap_end) {
+                        return false;
+                    }
+                    piece_base = piece_end;
+                }
+            }
+        }
+        true
+    }
+
+    fn visit_range_ref_rev_while(
+        &self,
+        child: ChildRef,
+        start: usize,
+        end: usize,
+        base: usize,
+        visit: &mut impl FnMut(Piece, usize, usize) -> bool,
+    ) -> bool {
+        let Some(page) = self.page(child.page_id) else {
+            return true;
+        };
+        match page.as_ref() {
+            PiecePage::Internal { children } => {
+                let mut child_end = base.saturating_add(child.total_bytes);
+                for child in children.iter().rev() {
+                    let child_start = child_end.saturating_sub(child.total_bytes);
+                    if child_start >= end {
+                        child_end = child_start;
+                        continue;
+                    }
+                    if child_end <= start {
+                        break;
+                    }
+                    if !self.visit_range_ref_rev_while(*child, start, end, child_start, visit) {
+                        return false;
+                    }
+                    child_end = child_start;
+                }
+            }
+            PiecePage::Leaf { pieces } => {
+                let mut piece_end = base.saturating_add(child.total_bytes);
+                for piece in pieces.iter().rev() {
+                    let piece_start = piece_end.saturating_sub(piece.len);
+                    if piece_start >= end {
+                        piece_end = piece_start;
+                        continue;
+                    }
+                    if piece_end <= start {
+                        break;
+                    }
+                    let overlap_start = start.saturating_sub(piece_start).min(piece.len);
+                    let overlap_end = end
+                        .min(piece_end)
+                        .saturating_sub(piece_start)
+                        .min(piece.len);
+                    if overlap_start < overlap_end && !visit(*piece, overlap_start, overlap_end) {
+                        return false;
+                    }
+                    piece_end = piece_start;
+                }
+            }
+        }
+        true
     }
 
     fn find_line_start_ref(
@@ -1552,8 +1816,8 @@ fn coalesce_adjacent(pieces: &mut Vec<Piece>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        editlog_path, source_metadata, DiskPageStore, Piece, PieceSource, PieceTree, SessionMeta,
-        SourceMetadata,
+        editlog_path, source_metadata, DiskPageStore, FragmentationStats, Piece, PieceSource,
+        PieceTree, SessionMeta, SourceMetadata,
     };
     use std::fs;
 
@@ -1703,6 +1967,129 @@ mod tests {
         assert_eq!(
             seen,
             vec![(PieceSource::Original, 2, 2), (PieceSource::Add, 10, 2)]
+        );
+    }
+
+    #[test]
+    fn visit_range_rev_emits_overlapping_piece_segments_in_reverse_order() {
+        let tree = PieceTree::from_pieces(vec![
+            Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 4,
+                line_breaks: 0,
+            },
+            Piece {
+                src: PieceSource::Add,
+                start: 10,
+                len: 3,
+                line_breaks: 0,
+            },
+            Piece {
+                src: PieceSource::Original,
+                start: 4,
+                len: 2,
+                line_breaks: 0,
+            },
+        ]);
+
+        let mut seen = Vec::new();
+        tree.visit_range_rev_while(2, 8, |piece, local_start, local_end| {
+            seen.push((
+                piece.src,
+                piece.start + local_start,
+                local_end - local_start,
+            ));
+            true
+        });
+
+        assert_eq!(
+            seen,
+            vec![
+                (PieceSource::Original, 4, 1),
+                (PieceSource::Add, 10, 3),
+                (PieceSource::Original, 2, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn visit_range_while_stops_after_callback_returns_false() {
+        let tree = PieceTree::from_pieces(vec![
+            Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 4,
+                line_breaks: 0,
+            },
+            Piece {
+                src: PieceSource::Add,
+                start: 10,
+                len: 3,
+                line_breaks: 0,
+            },
+            Piece {
+                src: PieceSource::Original,
+                start: 20,
+                len: 2,
+                line_breaks: 0,
+            },
+        ]);
+
+        let mut seen = Vec::new();
+        let completed = tree.visit_range_while(0, 9, |piece, local_start, local_end| {
+            seen.push((
+                piece.src,
+                piece.start + local_start,
+                local_end.saturating_sub(local_start),
+            ));
+            seen.len() < 2
+        });
+
+        assert!(!completed);
+        assert_eq!(
+            seen,
+            vec![(PieceSource::Original, 0, 4), (PieceSource::Add, 10, 3)]
+        );
+    }
+
+    #[test]
+    fn visit_range_rev_while_stops_after_callback_returns_false() {
+        let tree = PieceTree::from_pieces(vec![
+            Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 4,
+                line_breaks: 0,
+            },
+            Piece {
+                src: PieceSource::Add,
+                start: 10,
+                len: 3,
+                line_breaks: 0,
+            },
+            Piece {
+                src: PieceSource::Original,
+                start: 20,
+                len: 2,
+                line_breaks: 0,
+            },
+        ]);
+
+        let mut seen = Vec::new();
+        let completed = tree.visit_range_rev_while(0, 9, |piece, local_start, local_end| {
+            seen.push((
+                piece.src,
+                piece.start + local_start,
+                local_end.saturating_sub(local_start),
+            ));
+            seen.len() < 2
+        });
+
+        assert!(!completed);
+        assert_eq!(
+            seen,
+            vec![(PieceSource::Original, 20, 2), (PieceSource::Add, 10, 3)]
         );
     }
 
@@ -1873,5 +2260,67 @@ mod tests {
         let _ = fs::remove_file(&sidecar);
         let _ = fs::remove_file(&source);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fragmentation_stats_report_piece_size_distribution() {
+        let tree = PieceTree::from_pieces(vec![
+            Piece {
+                src: PieceSource::Original,
+                start: 0,
+                len: 4096,
+                line_breaks: 1,
+            },
+            Piece {
+                src: PieceSource::Add,
+                start: 0,
+                len: 16,
+                line_breaks: 0,
+            },
+            Piece {
+                src: PieceSource::Add,
+                start: 64,
+                len: 12,
+                line_breaks: 0,
+            },
+            Piece {
+                src: PieceSource::Original,
+                start: 4096,
+                len: 8192,
+                line_breaks: 2,
+            },
+        ]);
+
+        let stats = tree.fragmentation_stats_with_threshold(64);
+
+        assert_eq!(
+            stats,
+            FragmentationStats {
+                piece_count: 4,
+                total_bytes: 12_316,
+                smallest_piece_bytes: 12,
+                largest_piece_bytes: 8192,
+                small_piece_threshold_bytes: 64,
+                small_piece_count: 2,
+                small_piece_bytes: 28,
+            }
+        );
+        assert!((stats.average_piece_bytes() - 3079.0).abs() < f64::EPSILON);
+        assert!((stats.fragmentation_ratio() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fragmentation_stats_for_empty_tree_are_zeroed() {
+        let stats = PieceTree::new().fragmentation_stats();
+
+        assert_eq!(
+            stats,
+            FragmentationStats {
+                small_piece_threshold_bytes: super::DEFAULT_FRAGMENTATION_SMALL_PIECE_BYTES,
+                ..FragmentationStats::default()
+            }
+        );
+        assert_eq!(stats.average_piece_bytes(), 0.0);
+        assert_eq!(stats.fragmentation_ratio(), 0.0);
     }
 }

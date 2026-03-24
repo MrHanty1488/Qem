@@ -43,14 +43,14 @@ next `Document::open`, as long as the source file identity still matches.
 
 ```toml
 [dependencies]
-qem = "0.3"
+qem = "0.5"
 ```
 
 To disable the editor/session wrapper and use only the document/storage layer:
 
 ```toml
 [dependencies]
-qem = { version = "0.3", default-features = false }
+qem = { version = "0.5", default-features = false }
 ```
 
 ## Cargo features
@@ -67,7 +67,7 @@ Example:
 
 ```toml
 [dependencies]
-qem = { version = "0.3", default-features = false, features = ["editor", "tmp-exe-dir"] }
+qem = { version = "0.5", default-features = false, features = ["editor", "tmp-exe-dir"] }
 ```
 
 Runtime override is also available:
@@ -102,17 +102,17 @@ the selected temp policy.
 - A GUI typically renders visible rows through `Document::read_viewport(...)` or `DocumentSession::read_viewport(...)`.
 - Older compatibility helpers that silently swallow edit errors or expose raw tuple progress are still present for migration only, but they are deprecated and hidden from the main rustdoc surface in favor of the typed/session-first API.
 
-## 0.4.x Support Matrix
+## Current Support Matrix
 
-- UTF-8 / ASCII text is the primary `0.4.x` path: open, viewport reads, edits, undo/redo, and saves are supported.
-- Non-UTF8 or invalid UTF-8 bytes can still be opened and inspected, but text-facing APIs expose lossy UTF-8 views. Encoding-preserving edit/save behavior for arbitrary legacy encodings is not yet a stable `0.4.x` contract.
+- UTF-8 / ASCII text is the primary stable path: open, viewport reads, edits, undo/redo, and saves are supported.
+- Non-UTF8 or invalid UTF-8 bytes can still be opened and inspected, but text-facing APIs expose lossy UTF-8 views. Encoding-preserving edit/save behavior for arbitrary legacy encodings is not yet a stable contract.
 - Huge files are supported for mmap-backed reads, viewport rendering, line-count estimation, and background indexing without full materialization. Editing may be rejected when it would require unsafe rope promotion beyond the built-in size limits.
 - `.qem.lineidx` and `.qem.editlog` are internal cache/session sidecars. Qem invalidates them when file length, modification time, or sampled content fingerprint no longer match, and it may rebuild them across releases.
-- Typed progress/state APIs such as `indexing_state()`, `loading_state()`, `loading_phase()`, `save_state()`, `background_issue()`, `take_background_issue()`, and `close_pending()` are the supported session-facing surface for `0.4.x`.
-- Literal search is available through `find_next(...)` and `find_prev(...)` on `Document`, `DocumentSession`, and `EditorTab`. For repeated searches with the same needle, `LiteralSearchQuery` lets you reuse a compiled literal query instead of rebuilding search state every time. Bounded variants search only within a typed `TextRange` and reject matches that would cross the range boundary. In `0.4.x` this is a typed, case-sensitive literal search surface rather than a full regex/search subsystem.
-- `DocumentSession` and `EditorTab` typed edit helpers are idle-only in `0.4.x`: while a background open/save is active they return `EditUnsupported` instead of mutating a document that may soon be replaced or saved from an older snapshot. Raw `document_mut()` and `set_path()` remain escape hatches, but using either while busy invalidates the in-flight worker result so the next poll returns an error instead of applying stale state. If a close was deferred at the time, that new state change also cancels the deferred close.
-- `close_file()` is also truthful in `0.4.x`: if a background open/save is still running, the close is deferred until that job completes instead of silently dropping the worker result. Deferred closes after background saves are only applied on success; a failed save keeps the dirty document open.
-- Repeated async open/save requests use a first-job-wins policy in `0.4.x`: while a load/save is active, later requests are rejected and the original worker remains authoritative until `poll_background_job()` consumes its result.
+- Typed progress/state APIs such as `indexing_state()`, `loading_state()`, `loading_phase()`, `save_state()`, `background_issue()`, `take_background_issue()`, and `close_pending()` are the supported session-facing surface.
+- Literal search is available through `find_next(...)`, `find_prev(...)`, and `find_all(...)` on `Document`, `DocumentSession`, and `EditorTab`. For repeated searches with the same needle, `LiteralSearchQuery` lets you reuse a compiled literal query instead of rebuilding search state every time, including iterator paths through `find_all_query(...)` and the bounded `find_all_query_*` helpers. Bounded variants search only within a typed `TextRange` and reject matches that would cross the range boundary. This is a typed, case-sensitive literal search surface rather than a full regex/search subsystem.
+- `DocumentSession` and `EditorTab` typed edit helpers are idle-only: while a background open/save is active they return `EditUnsupported` instead of mutating a document that may soon be replaced or saved from an older snapshot. Raw `document_mut()` and `set_path()` remain escape hatches, but using either while busy invalidates the in-flight worker result so the next poll returns an error instead of applying stale state. If a close was deferred at the time, that new state change also cancels the deferred close.
+- `close_file()` is also truthful: if a background open/save is still running, the close is deferred until that job completes instead of silently dropping the worker result. Deferred closes after background saves are only applied on success; a failed save keeps the dirty document open.
+- Repeated async open/save requests use a first-job-wins policy: while a load/save is active, later requests are rejected and the original worker remains authoritative until `poll_background_job()` consumes its result.
 - Typed positions, ranges, and viewport columns use document text units. For UTF-8 text, line-local columns count Unicode scalar values, not grapheme clusters and not display cells. Stored CRLF still counts as one text unit between lines.
 
 ## Column Semantics
@@ -136,8 +136,9 @@ Qem stays UI-agnostic on purpose, but the intended editor/frontend flow is:
 8. If the user closes a session/tab while `is_busy()` is true, keep polling until the current job completes; `close_file()` defers the actual close so the engine can finish and account for the in-flight worker result. If a background save fails, surface the error and keep the document open for retry or explicit discard.
 9. While `is_busy()` is true, treat the current `loading_state()` or `save_state()` path as authoritative. New async open/save requests will be rejected until you poll and finish that active job. The file write runs on a worker thread, but `save_async()` and `save_as_async()` still snapshot the current document before that worker starts, so very large edited buffers can make the call itself noticeable.
 10. Keep GUI selection state as `TextSelection { anchor, head }`, read it through `read_selection(...)` for copy flows, convert it into a `TextRange` with `text_range_for_selection(...)` when needed, or use `try_replace_selection(...)` / `try_delete_selection(...)` / `try_cut_selection(...)` directly. For key handling, `try_backspace_selection(...)` and `try_delete_forward_selection(...)` handle the usual "delete selection or fall back to caret command" path for you.
-11. For literal search, use `find_next(...)` and `find_prev(...)` and keep the returned `SearchMatch` as a typed `TextRange`/selection source for highlight or replace flows. If you are repeating the same search many times from UI state, build one `LiteralSearchQuery` and call `find_next_query(...)` / `find_prev_query(...)` instead. If the search must stay inside a selection or other local region, use `find_next_in_range(...)` / `find_prev_in_range(...)` or the query-based bounded variants. `find_prev(...)` returns the last match whose end is at or before the boundary position you pass, and bounded search only returns matches fully contained within the requested `TextRange`. On clean mmap and piece-table backings this search follows stored bytes, including stored CRLF; rope-backed documents search the current in-memory `\n` representation.
-12. Then save with `save_to(...)`, `DocumentSession::save_async(...)`, or `DocumentSession::save_as_async(...)`.
+11. For literal search, use `find_next(...)`, `find_prev(...)`, or `find_all(...)` and keep the returned `SearchMatch` values as typed `TextRange`/selection sources for highlight or replace flows. If you are repeating the same search many times from UI state, build one `LiteralSearchQuery` and call `find_next_query(...)` / `find_prev_query(...)` or the iterator forms `find_all_query(...)` / `find_all_query_from(...)` instead. If the search must stay inside a selection or other local region, use `find_next_in_range(...)` / `find_prev_in_range(...)` / `find_all_in_range(...)` or the query-based bounded variants. When you already have explicit selection endpoints, prefer the position-bounded `find_next_between(...)`, `find_prev_between(...)`, `find_next_query_between(...)`, `find_prev_query_between(...)`, `find_all_between(...)`, and `find_all_query_between(...)` helpers so callers do not have to precompute a typed `TextRange`. `find_prev(...)` returns the last match whose end is at or before the boundary position you pass, and bounded search only returns matches fully contained within the requested range. On clean mmap and piece-table backings this search follows stored bytes, including stored CRLF; rope-backed documents search the current in-memory `\n` representation.
+12. For long-lived edited piece-table documents, treat compaction as an idle-time maintenance step. Prefer `maintenance_status()` or `maintenance_status_with_policy(...)` when the UI wants one explicit maintenance snapshot; use `recommended_action()` or the direct `maintenance_action()` helpers when the frontend only wants a high-level decision. Then run `run_idle_compaction()` or `run_idle_compaction_with_policy(...)` while the UI is idle. If the returned outcome says `ForcedPending`, or the snapshot says `explicit-compaction`, reserve the heavier rewrite for save-boundary or explicit operator maintenance. Keep unconditional `compact_piece_table()` for explicit maintenance flows.
+13. Then save with `save_to(...)`, `DocumentSession::save_async(...)`, or `DocumentSession::save_as_async(...)`.
 
 The new `frontend_session` example demonstrates that engine-facing lifecycle without pulling any GUI toolkit into the crate:
 
@@ -147,7 +148,7 @@ cargo run --example frontend_session --features editor -- input.txt output.txt
 
 ## Stability Notes
 
-- The Rust API is intended to be stable within the `0.4.x` release line except
+- The Rust API is intended to be stable within the current release line except
   for clearly documented fixes to incorrect behavior.
 - Sidecar artifacts such as `.qem.editlog` and `.qem.lineidx` are internal
   cache/session formats. Qem may regenerate them across releases, and callers
@@ -181,9 +182,10 @@ cargo run --example frontend_session --features editor -- input.txt output.txt
 ```
 
 The `frontend_session` example shows how a frontend can poll load/save/index
-state, distinguish open phases from continued indexing, compute a viewport, and
-render visible rows through `DocumentSession::read_viewport(...)` while keeping
-UI concerns out of the engine.
+state, distinguish open phases from continued indexing, compute a viewport,
+read one maintenance snapshot through `maintenance_status()`, and render
+visible rows through `DocumentSession::read_viewport(...)` while keeping UI
+concerns out of the engine.
 
 Exercise the typed `Document` edit/read API directly:
 
@@ -194,7 +196,26 @@ cargo run --example typed_editing -- input.txt output.txt
 The `typed_editing` example shows a minimal non-session flow built around
 `read_selection(...)`, `try_replace_selection(...)`, `try_cut_selection(...)`,
 `read_text(...)`, `LiteralSearchQuery`, `find_next_query(...)`,
-`find_prev_query(...)`, and `save_to(...)`.
+`find_prev_query(...)`, `maintenance_status()`, and `save_to(...)`.
+
+Probe real files outside the synthetic Criterion fixtures:
+
+```powershell
+cargo run --example perf_probe -- input.txt --needle ERROR --seed-edit "[probe]\n" --save output.txt
+```
+
+The `perf_probe` example prints one-shot timings for `open`, indexing wait,
+viewport reads, literal search, idle-maintenance state, and optional `save_to`
+so you can build a cold/warm matrix on real `1GB / 10GB / 50GB` files.
+Use `--find-all-limit` and optional `--find-all-range-lines` when you want a
+fast capped probe of dense iterator throughput without waiting on full
+Criterion dense-match runs.
+Pass `--json` when you want machine-readable output for scripts or spreadsheet
+pipelines.
+
+For repeated `clean/edited` probe runs across several files, use
+`.\scripts\collect_perf_matrix.ps1` to produce one JSONL matrix instead of
+hand-running each `perf_probe` command.
 
 ## API Example
 
@@ -235,9 +256,10 @@ Qem ships with Criterion benchmarks for:
 - session-layer `text()` and `status()` overhead relative to raw `Document`
 - viewport reads after large-file edits through the piece table
 - typed text reads through `read_text` and `read_selection`
-- typed literal search through `find_next` and `find_prev`
+- typed literal search through `find_next` and `find_prev`, including bounded-range, no-match, and dense-match scenarios
 - full-text materialization through `text_lossy`
 - typed edit commands such as `try_insert`, `try_replace_selection`, and `try_delete_selection`
+- piece-table compaction on fragmented edited documents
 - streaming saves of edited large files
 
 The built-in fixture sizes currently include:
@@ -262,5 +284,6 @@ cargo bench --bench document_perf -- session_layer
 
 ## Project Links
 
+- Benchmark methodology lives in [`BENCHMARKS.md`](BENCHMARKS.md).
 - CI lives in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 - Repository: <https://github.com/MrHanty1488/Qem>

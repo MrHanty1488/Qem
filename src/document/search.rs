@@ -1,6 +1,9 @@
 use super::*;
 use memchr::memmem::{Finder, FinderRev};
 
+const REVERSE_POSITION_FAST_PATH_BYTES: usize = 1024;
+const BUFFERED_LITERAL_RANGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, Default)]
 struct PositionScanState {
     line0: usize,
@@ -206,6 +209,139 @@ impl LiteralSearchQuery {
     }
 }
 
+/// Iterator over non-overlapping literal matches in the current document.
+///
+/// The iterator owns its compiled query and advances from the end of each
+/// match, so overlapping matches are intentionally skipped.
+#[derive(Debug)]
+pub struct LiteralSearchIter<'a> {
+    doc: &'a Document,
+    query: Option<LiteralSearchQuery>,
+    next_from: TextPosition,
+    next_offset: usize,
+    end: Option<TextPosition>,
+    end_offset: Option<usize>,
+    buffered_range: Option<BufferedLiteralSearchRange>,
+    finished: bool,
+}
+
+#[derive(Debug)]
+struct BufferedLiteralSearchRange {
+    base_offset: usize,
+    bytes: Vec<u8>,
+    next_rel_offset: usize,
+}
+
+impl<'a> LiteralSearchIter<'a> {
+    fn from_query(
+        doc: &'a Document,
+        query: Option<LiteralSearchQuery>,
+        next_from: TextPosition,
+        end: Option<TextPosition>,
+    ) -> Self {
+        let next_from = doc.clamp_position(next_from);
+        let end = end.map(|position| doc.clamp_position(position));
+        let next_offset = doc.search_byte_offset_for_position(next_from);
+        let end_offset = end.map(|position| doc.search_byte_offset_for_position(position));
+        let buffered_range = if query.is_some() {
+            match end_offset {
+                Some(end_offset) => {
+                    doc.buffered_literal_range(next_offset, end_offset)
+                        .map(|bytes| BufferedLiteralSearchRange {
+                            base_offset: next_offset,
+                            bytes,
+                            next_rel_offset: 0,
+                        })
+                }
+                None => doc
+                    .buffered_literal_range(next_offset, doc.file_len())
+                    .map(|bytes| BufferedLiteralSearchRange {
+                        base_offset: next_offset,
+                        bytes,
+                        next_rel_offset: 0,
+                    }),
+            }
+        } else {
+            None
+        };
+        Self {
+            doc,
+            query,
+            next_offset,
+            next_from,
+            end_offset,
+            end,
+            buffered_range,
+            finished: false,
+        }
+    }
+}
+
+impl Iterator for LiteralSearchIter<'_> {
+    type Item = SearchMatch;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        let query = self.query.as_ref()?;
+        if let Some(buffered) = self.buffered_range.as_mut() {
+            if buffered.next_rel_offset >= buffered.bytes.len() {
+                self.finished = true;
+                return None;
+            }
+            let rel = query
+                .finder
+                .find(&buffered.bytes[buffered.next_rel_offset..])?;
+            let match_start_rel = buffered.next_rel_offset.saturating_add(rel);
+            let start_pos = if match_start_rel == buffered.next_rel_offset {
+                self.next_from
+            } else {
+                advance_position_by_bytes(
+                    self.next_from,
+                    &buffered.bytes[buffered.next_rel_offset..match_start_rel],
+                )
+            };
+            let match_end_rel = match_start_rel
+                .saturating_add(query.bytes().len())
+                .min(buffered.bytes.len());
+            let end_pos = advance_position_by_bytes(start_pos, query.bytes());
+            buffered.next_rel_offset = match_end_rel;
+            self.next_from = end_pos;
+            self.next_offset = buffered.base_offset.saturating_add(match_end_rel);
+            return Some(SearchMatch::new(
+                TextRange::new(start_pos, query.len_chars()),
+                end_pos,
+            ));
+        }
+        let found = if let Some(end) = self.end {
+            if self.next_from >= end {
+                self.finished = true;
+                return None;
+            }
+            let end_offset = self.end_offset.unwrap_or(self.next_offset);
+            self.doc.find_next_with_offset_hint_bounded(
+                query.bytes(),
+                query.len_chars(),
+                &query.finder,
+                (self.next_from, self.next_offset),
+                (end, end_offset),
+            )?
+        } else {
+            self.doc.find_next_with_offset_hint(
+                query.bytes(),
+                query.len_chars(),
+                &query.finder,
+                self.next_from,
+                self.next_offset,
+            )?
+        };
+        self.next_offset = found.1;
+        self.next_from = found.0.end();
+        Some(found.0)
+    }
+}
+
 impl Document {
     /// Finds the next literal match starting at `from`.
     ///
@@ -267,6 +403,103 @@ impl Document {
         self.find_prev_with_finder(query.bytes(), query.len_chars(), &query.finder_rev, before)
     }
 
+    /// Iterates non-overlapping literal matches in the whole document.
+    ///
+    /// Empty needles yield an empty iterator.
+    pub fn find_all(&self, needle: impl Into<String>) -> LiteralSearchIter<'_> {
+        self.find_all_from(needle, TextPosition::new(0, 0))
+    }
+
+    /// Iterates non-overlapping literal matches from `from` to the end of the document.
+    ///
+    /// Empty needles yield an empty iterator.
+    pub fn find_all_from(
+        &self,
+        needle: impl Into<String>,
+        from: TextPosition,
+    ) -> LiteralSearchIter<'_> {
+        LiteralSearchIter::from_query(
+            self,
+            LiteralSearchQuery::new(needle),
+            self.clamp_position(from),
+            None,
+        )
+    }
+
+    /// Iterates non-overlapping literal matches from `from` onward using a
+    /// reusable compiled query.
+    pub fn find_all_query_from(
+        &self,
+        query: &LiteralSearchQuery,
+        from: TextPosition,
+    ) -> LiteralSearchIter<'_> {
+        LiteralSearchIter::from_query(self, Some(query.clone()), self.clamp_position(from), None)
+    }
+
+    /// Iterates non-overlapping literal matches in the whole document using a
+    /// reusable compiled query.
+    pub fn find_all_query(&self, query: &LiteralSearchQuery) -> LiteralSearchIter<'_> {
+        self.find_all_query_from(query, TextPosition::new(0, 0))
+    }
+
+    /// Iterates non-overlapping literal matches fully contained within `range`.
+    ///
+    /// Empty needles yield an empty iterator.
+    pub fn find_all_in_range(
+        &self,
+        needle: impl Into<String>,
+        range: TextRange,
+    ) -> LiteralSearchIter<'_> {
+        let (start, end) = self.search_range_bounds(range);
+        self.find_all_between_internal(LiteralSearchQuery::new(needle), start, end)
+    }
+
+    /// Iterates non-overlapping literal matches between two typed positions.
+    ///
+    /// The bounds are clamped and ordered before searching. Empty needles yield
+    /// an empty iterator.
+    pub fn find_all_between(
+        &self,
+        needle: impl Into<String>,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> LiteralSearchIter<'_> {
+        let (start, end) = self.ordered_positions(start, end);
+        self.find_all_between_internal(LiteralSearchQuery::new(needle), start, end)
+    }
+
+    /// Iterates non-overlapping literal matches fully contained within `range`
+    /// using a reusable compiled query.
+    pub fn find_all_query_in_range(
+        &self,
+        query: &LiteralSearchQuery,
+        range: TextRange,
+    ) -> LiteralSearchIter<'_> {
+        let (start, end) = self.search_range_bounds(range);
+        self.find_all_query_between(query, start, end)
+    }
+
+    /// Iterates non-overlapping literal matches between two typed positions
+    /// using a reusable compiled query.
+    pub fn find_all_query_between(
+        &self,
+        query: &LiteralSearchQuery,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> LiteralSearchIter<'_> {
+        self.find_all_between_internal(Some(query.clone()), start, end)
+    }
+
+    fn find_all_between_internal(
+        &self,
+        query: Option<LiteralSearchQuery>,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> LiteralSearchIter<'_> {
+        let (start, end) = self.ordered_positions(start, end);
+        LiteralSearchIter::from_query(self, query, start, Some(end))
+    }
+
     /// Finds the first literal match fully contained within `range`.
     pub fn find_next_in_range(&self, needle: &str, range: TextRange) -> Option<SearchMatch> {
         if needle.is_empty() {
@@ -280,7 +513,30 @@ impl Document {
         }
 
         let finder = Finder::new(needle_bytes);
-        self.find_next_in_range_with_finder(needle_bytes, needle_units, &finder, range)
+        let (start, end) = self.search_range_bounds(range);
+        self.find_next_bounded_with_finder(needle_bytes, needle_units, &finder, start, end)
+    }
+
+    /// Finds the first literal match fully contained between two typed positions.
+    pub fn find_next_between(
+        &self,
+        needle: &str,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> Option<SearchMatch> {
+        if needle.is_empty() {
+            return None;
+        }
+
+        let needle_bytes = needle.as_bytes();
+        let needle_units = search_text_units(needle);
+        if needle_units == 0 {
+            return None;
+        }
+
+        let finder = Finder::new(needle_bytes);
+        let (start, end) = self.ordered_positions(start, end);
+        self.find_next_bounded_with_finder(needle_bytes, needle_units, &finder, start, end)
     }
 
     /// Finds the last literal match fully contained within `range`.
@@ -296,7 +552,30 @@ impl Document {
         }
 
         let finder_rev = FinderRev::new(needle_bytes);
-        self.find_prev_in_range_with_finder(needle_bytes, needle_units, &finder_rev, range)
+        let (start, end) = self.search_range_bounds(range);
+        self.find_prev_bounded_with_finder(needle_bytes, needle_units, &finder_rev, start, end)
+    }
+
+    /// Finds the last literal match fully contained between two typed positions.
+    pub fn find_prev_between(
+        &self,
+        needle: &str,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> Option<SearchMatch> {
+        if needle.is_empty() {
+            return None;
+        }
+
+        let needle_bytes = needle.as_bytes();
+        let needle_units = search_text_units(needle);
+        if needle_units == 0 {
+            return None;
+        }
+
+        let finder_rev = FinderRev::new(needle_bytes);
+        let (start, end) = self.ordered_positions(start, end);
+        self.find_prev_bounded_with_finder(needle_bytes, needle_units, &finder_rev, start, end)
     }
 
     /// Finds the first query match fully contained within `range`.
@@ -305,7 +584,31 @@ impl Document {
         query: &LiteralSearchQuery,
         range: TextRange,
     ) -> Option<SearchMatch> {
-        self.find_next_in_range_with_finder(query.bytes(), query.len_chars(), &query.finder, range)
+        let (start, end) = self.search_range_bounds(range);
+        self.find_next_bounded_with_finder(
+            query.bytes(),
+            query.len_chars(),
+            &query.finder,
+            start,
+            end,
+        )
+    }
+
+    /// Finds the first query match fully contained between two typed positions.
+    pub fn find_next_query_between(
+        &self,
+        query: &LiteralSearchQuery,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> Option<SearchMatch> {
+        let (start, end) = self.ordered_positions(start, end);
+        self.find_next_bounded_with_finder(
+            query.bytes(),
+            query.len_chars(),
+            &query.finder,
+            start,
+            end,
+        )
     }
 
     /// Finds the last query match fully contained within `range`.
@@ -314,22 +617,41 @@ impl Document {
         query: &LiteralSearchQuery,
         range: TextRange,
     ) -> Option<SearchMatch> {
-        self.find_prev_in_range_with_finder(
+        let (start, end) = self.search_range_bounds(range);
+        self.find_prev_bounded_with_finder(
             query.bytes(),
             query.len_chars(),
             &query.finder_rev,
-            range,
+            start,
+            end,
         )
     }
 
-    fn find_next_in_range_with_finder(
+    /// Finds the last query match fully contained between two typed positions.
+    pub fn find_prev_query_between(
+        &self,
+        query: &LiteralSearchQuery,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> Option<SearchMatch> {
+        let (start, end) = self.ordered_positions(start, end);
+        self.find_prev_bounded_with_finder(
+            query.bytes(),
+            query.len_chars(),
+            &query.finder_rev,
+            start,
+            end,
+        )
+    }
+
+    fn find_next_bounded_with_finder(
         &self,
         needle_bytes: &[u8],
         needle_units: usize,
         finder: &Finder<'_>,
-        range: TextRange,
+        start: TextPosition,
+        end: TextPosition,
     ) -> Option<SearchMatch> {
-        let (start, end) = self.search_range_bounds(range);
         if start >= end {
             return None;
         }
@@ -338,14 +660,72 @@ impl Document {
         (found.end() <= end).then_some(found)
     }
 
-    fn find_prev_in_range_with_finder(
+    fn find_next_with_offset_hint(
+        &self,
+        needle_bytes: &[u8],
+        needle_units: usize,
+        finder: &Finder<'_>,
+        from: TextPosition,
+        from_offset: usize,
+    ) -> Option<(SearchMatch, usize)> {
+        if let Some(rope) = &self.rope {
+            return self.find_next_in_rope_from_offset(
+                rope,
+                needle_bytes,
+                needle_units,
+                finder,
+                from,
+                from_offset,
+            );
+        }
+
+        let from = self.clamp_position(from);
+        if let Some(piece_table) = &self.piece_table {
+            return self.find_next_in_piece_table_from_offset(
+                piece_table,
+                needle_bytes,
+                needle_units,
+                finder,
+                from,
+                from_offset,
+            );
+        }
+
+        self.find_next_in_mmap_from_offset(needle_bytes, needle_units, finder, from, from_offset)
+    }
+
+    fn find_next_with_offset_hint_bounded(
+        &self,
+        needle_bytes: &[u8],
+        needle_units: usize,
+        finder: &Finder<'_>,
+        start: (TextPosition, usize),
+        end: (TextPosition, usize),
+    ) -> Option<(SearchMatch, usize)> {
+        let (start, start_offset) = start;
+        let (end, end_offset) = end;
+        if start >= end || start_offset >= end_offset {
+            return None;
+        }
+
+        let found = self.find_next_with_offset_hint(
+            needle_bytes,
+            needle_units,
+            finder,
+            start,
+            start_offset,
+        )?;
+        (found.0.end() <= end).then_some(found)
+    }
+
+    fn find_prev_bounded_with_finder(
         &self,
         needle_bytes: &[u8],
         needle_units: usize,
         finder_rev: &FinderRev<'_>,
-        range: TextRange,
+        start: TextPosition,
+        end: TextPosition,
     ) -> Option<SearchMatch> {
-        let (start, end) = self.search_range_bounds(range);
         if start >= end {
             return None;
         }
@@ -356,8 +736,27 @@ impl Document {
 
     fn search_range_bounds(&self, range: TextRange) -> (TextPosition, TextPosition) {
         let start = self.clamp_position(range.start());
-        let start_idx = self.char_index_for_position(start);
-        let end = self.position_for_char_index(start_idx.saturating_add(range.len_chars()));
+        if range.is_empty() {
+            return (start, start);
+        }
+
+        if let Some(rope) = &self.rope {
+            let start_idx = Self::line_col_to_char_index(rope, start.line0(), start.col0());
+            let end = self.position_for_char_index(start_idx.saturating_add(range.len_chars()));
+            return (start, end);
+        }
+
+        if let Some(piece_table) = &self.piece_table {
+            let start_offset = piece_table.byte_offset_for_col(start.line0(), start.col0());
+            let end_offset =
+                piece_table.advance_offset_by_text_units(start_offset, range.len_chars());
+            let end = piece_table.position_for_byte_offset_from(start_offset, start, end_offset);
+            return (start, end);
+        }
+
+        let start_offset = self.mmap_byte_offset_for_position(start);
+        let end_offset = self.mmap_advance_offset_by_text_units(start_offset, range.len_chars());
+        let end = self.mmap_position_for_byte_offset_from(start_offset, start, end_offset);
         (start, end)
     }
 
@@ -432,6 +831,33 @@ impl Document {
         ))
     }
 
+    fn find_next_in_rope_from_offset(
+        &self,
+        rope: &Rope,
+        needle: &[u8],
+        needle_units: usize,
+        finder: &Finder<'_>,
+        from: TextPosition,
+        start_byte: usize,
+    ) -> Option<(SearchMatch, usize)> {
+        let start_byte = start_byte.min(rope.len_bytes());
+        let match_start = find_next_in_rope_chunks(rope, start_byte, needle.len(), finder)?;
+        let start_pos = if match_start == start_byte {
+            from
+        } else {
+            let start_char = rope.byte_to_char(match_start);
+            self.position_for_char_index(start_char)
+        };
+        let end_pos = advance_position_by_bytes(start_pos, needle);
+        let match_end = match_start
+            .saturating_add(needle.len())
+            .min(rope.len_bytes());
+        Some((
+            SearchMatch::new(TextRange::new(start_pos, needle_units), end_pos),
+            match_end,
+        ))
+    }
+
     fn find_next_in_mmap(
         &self,
         needle: &[u8],
@@ -454,6 +880,32 @@ impl Document {
         Some(SearchMatch::new(
             TextRange::new(start_pos, needle_units),
             end_pos,
+        ))
+    }
+
+    fn find_next_in_mmap_from_offset(
+        &self,
+        needle: &[u8],
+        needle_units: usize,
+        finder: &Finder<'_>,
+        from: TextPosition,
+        start_offset: usize,
+    ) -> Option<(SearchMatch, usize)> {
+        let bytes = self.mmap_bytes();
+        let file_len = self.file_len.min(bytes.len());
+        if file_len == 0 {
+            return None;
+        }
+
+        let start_offset = start_offset.min(file_len);
+        let rel = finder.find(&bytes[start_offset..file_len])?;
+        let match_start = start_offset.saturating_add(rel);
+        let match_end = match_start.saturating_add(needle.len()).min(file_len);
+        let start_pos = self.mmap_position_for_byte_offset_from(start_offset, from, match_start);
+        let end_pos = advance_position_by_bytes(start_pos, needle);
+        Some((
+            SearchMatch::new(TextRange::new(start_pos, needle_units), end_pos),
+            match_end,
         ))
     }
 
@@ -489,14 +941,45 @@ impl Document {
         finder: &Finder<'_>,
         from: TextPosition,
     ) -> Option<SearchMatch> {
-        let start_col0 = from.col0().min(piece_table.line_len_chars(from.line0()));
+        let start_col0 = from.col0();
+        let start_pos = TextPosition::new(from.line0(), start_col0);
         let start_offset = piece_table.byte_offset_for_col(from.line0(), start_col0);
-        let match_start = piece_table.find_literal_next(start_offset, needle.len(), finder)?;
-        let start_pos = piece_table.position_for_byte_offset(match_start);
+        let (start_pos, _) = piece_table.find_literal_next_from_position(
+            start_offset,
+            start_pos,
+            needle.len(),
+            finder,
+        )?;
         let end_pos = advance_position_by_bytes(start_pos, needle);
         Some(SearchMatch::new(
             TextRange::new(start_pos, needle_units),
             end_pos,
+        ))
+    }
+
+    fn find_next_in_piece_table_from_offset(
+        &self,
+        piece_table: &PieceTable,
+        needle: &[u8],
+        needle_units: usize,
+        finder: &Finder<'_>,
+        from: TextPosition,
+        start_offset: usize,
+    ) -> Option<(SearchMatch, usize)> {
+        let start_offset = start_offset.min(piece_table.total_len);
+        let (start_pos, match_start) = piece_table.find_literal_next_from_position(
+            start_offset,
+            from,
+            needle.len(),
+            finder,
+        )?;
+        let match_end = match_start
+            .saturating_add(needle.len())
+            .min(piece_table.total_len);
+        let end_pos = advance_position_by_bytes(start_pos, needle);
+        Some((
+            SearchMatch::new(TextRange::new(start_pos, needle_units), end_pos),
+            match_end,
         ))
     }
 
@@ -508,12 +991,20 @@ impl Document {
         finder_rev: &FinderRev<'_>,
         before: TextPosition,
     ) -> Option<SearchMatch> {
-        let end_col0 = before
-            .col0()
-            .min(piece_table.line_len_chars(before.line0()));
-        let end_offset = piece_table.byte_offset_for_col(before.line0(), end_col0);
+        let mut search_before = before;
+        let mut end_offset = piece_table.byte_offset_for_col(before.line0(), before.col0());
+        if memchr::memchr2(b'\n', b'\r', needle).is_none() {
+            if let Some((adjusted_before, adjusted_end_offset)) =
+                piece_table.prev_search_anchor_before_trailing_newline(before, end_offset)
+            {
+                search_before = adjusted_before;
+                end_offset = adjusted_end_offset;
+            }
+        }
         let match_start = piece_table.find_literal_prev(end_offset, needle.len(), finder_rev)?;
-        let start_pos = piece_table.position_for_byte_offset(match_start);
+        let start_pos = piece_table
+            .position_for_byte_offset_before_same_line(end_offset, search_before, match_start)
+            .unwrap_or_else(|| piece_table.position_for_byte_offset(match_start));
         let end_pos = advance_position_by_bytes(start_pos, needle);
         Some(SearchMatch::new(
             TextRange::new(start_pos, needle_units),
@@ -570,6 +1061,106 @@ impl Document {
         state.position()
     }
 
+    fn mmap_position_for_byte_offset_from(
+        &self,
+        anchor_offset: usize,
+        anchor_position: TextPosition,
+        byte_offset: usize,
+    ) -> TextPosition {
+        let bytes = self.mmap_bytes();
+        let file_len = self.file_len.min(bytes.len());
+        let anchor_offset = anchor_offset.min(file_len);
+        let target = byte_offset.min(file_len);
+        if target <= anchor_offset {
+            return anchor_position;
+        }
+
+        let mut state = PositionScanState::new(anchor_position.line0(), anchor_position.col0());
+        scan_position_bytes(&bytes[anchor_offset..target], &mut state);
+        state.position()
+    }
+
+    fn mmap_advance_offset_by_text_units(&self, start: usize, text_units: usize) -> usize {
+        let bytes = self.mmap_bytes();
+        let file_len = self.file_len.min(bytes.len());
+        let start = start.min(file_len);
+        if text_units == 0 || start >= file_len {
+            return start;
+        }
+
+        let mut remaining = text_units;
+        let mut offset = start;
+        let mut pending_cr = false;
+        let mut i = start;
+        while i < file_len && (remaining > 0 || pending_cr) {
+            if pending_cr {
+                pending_cr = false;
+                if bytes[i] == b'\n' {
+                    i += 1;
+                    offset = offset.saturating_add(1);
+                    continue;
+                }
+            }
+
+            match bytes[i] {
+                b'\n' => {
+                    remaining = remaining.saturating_sub(1);
+                    i += 1;
+                    offset = offset.saturating_add(1);
+                }
+                b'\r' => {
+                    remaining = remaining.saturating_sub(1);
+                    pending_cr = true;
+                    i += 1;
+                    offset = offset.saturating_add(1);
+                }
+                _ => {
+                    remaining = remaining.saturating_sub(1);
+                    let step = utf8_step(bytes, i, file_len);
+                    i += step;
+                    offset = offset.saturating_add(step);
+                }
+            }
+        }
+        offset.min(file_len)
+    }
+
+    fn search_byte_offset_for_position(&self, position: TextPosition) -> usize {
+        let position = self.clamp_position(position);
+        if let Some(rope) = &self.rope {
+            let char_index = Self::line_col_to_char_index(rope, position.line0(), position.col0());
+            return rope.char_to_byte(char_index);
+        }
+        if let Some(piece_table) = &self.piece_table {
+            return piece_table.byte_offset_for_col(position.line0(), position.col0());
+        }
+        self.mmap_byte_offset_for_position(position)
+    }
+
+    fn buffered_literal_range(&self, start_offset: usize, end_offset: usize) -> Option<Vec<u8>> {
+        if start_offset >= end_offset {
+            return Some(Vec::new());
+        }
+        let span = end_offset.saturating_sub(start_offset);
+        if span > BUFFERED_LITERAL_RANGE_MAX_BYTES {
+            return None;
+        }
+
+        if let Some(piece_table) = &self.piece_table {
+            return Some(piece_table.read_range(start_offset, end_offset));
+        }
+
+        if self.rope.is_some() {
+            return None;
+        }
+
+        let bytes = self.mmap_bytes();
+        let file_len = self.file_len.min(bytes.len());
+        let start = start_offset.min(file_len);
+        let end = end_offset.min(file_len).max(start);
+        Some(bytes[start..end].to_vec())
+    }
+
     fn find_prev_in_rope(
         &self,
         rope: &Rope,
@@ -593,6 +1184,64 @@ impl Document {
 }
 
 impl PieceTable {
+    fn prev_search_anchor_before_trailing_newline(
+        &self,
+        before: TextPosition,
+        end_offset: usize,
+    ) -> Option<(TextPosition, usize)> {
+        if before.line0() == 0
+            || before.col0() != 0
+            || end_offset == 0
+            || end_offset != self.total_len
+        {
+            return None;
+        }
+
+        let newline_len = self.newline_len_before(end_offset);
+        if newline_len == 0 {
+            return None;
+        }
+
+        let prev_line0 = before.line0().saturating_sub(1);
+        let prev_col0 = self.line_len_chars(prev_line0);
+        Some((
+            TextPosition::new(prev_line0, prev_col0),
+            end_offset.saturating_sub(newline_len),
+        ))
+    }
+
+    fn position_for_byte_offset_before_same_line(
+        &self,
+        anchor_offset: usize,
+        anchor_position: TextPosition,
+        byte_offset: usize,
+    ) -> Option<TextPosition> {
+        let anchor_offset = anchor_offset.min(self.total_len);
+        let target = byte_offset.min(anchor_offset);
+        if target == anchor_offset {
+            return Some(anchor_position);
+        }
+
+        let span = anchor_offset.saturating_sub(target);
+        if span == 0 || span > REVERSE_POSITION_FAST_PATH_BYTES || anchor_position.col0() == 0 {
+            return None;
+        }
+
+        let bytes = self.read_range(target, anchor_offset);
+        if memchr::memchr2(b'\n', b'\r', &bytes).is_some() {
+            return None;
+        }
+
+        let mut units = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            units = units.saturating_add(1);
+            i += utf8_step(&bytes, i, bytes.len());
+        }
+        (units <= anchor_position.col0())
+            .then(|| TextPosition::new(anchor_position.line0(), anchor_position.col0() - units))
+    }
+
     fn position_for_byte_offset(&self, byte_offset: usize) -> TextPosition {
         let target = byte_offset.min(self.total_len);
         if target == 0 {
@@ -610,12 +1259,36 @@ impl PieceTable {
         state.position()
     }
 
-    fn find_literal_next(
+    fn position_for_byte_offset_from(
+        &self,
+        anchor_offset: usize,
+        anchor_position: TextPosition,
+        byte_offset: usize,
+    ) -> TextPosition {
+        let anchor_offset = anchor_offset.min(self.total_len);
+        let target = byte_offset.min(self.total_len);
+        if target <= anchor_offset {
+            return anchor_position;
+        }
+
+        let mut state = PositionScanState::new(anchor_position.line0(), anchor_position.col0());
+        self.pieces
+            .visit_range(anchor_offset, target, |piece, local_start, local_end| {
+                let seg_start = piece.start + local_start;
+                let seg_end = piece.start + local_end;
+                let src = self.source_bytes(piece.src);
+                scan_position_bytes(&src[seg_start..seg_end], &mut state);
+            });
+        state.position()
+    }
+
+    fn find_literal_next_from_position(
         &self,
         start: usize,
+        start_pos: TextPosition,
         needle_len: usize,
         finder: &Finder<'_>,
-    ) -> Option<usize> {
+    ) -> Option<(TextPosition, usize)> {
         if needle_len == 0 || start >= self.total_len {
             return None;
         }
@@ -623,34 +1296,41 @@ impl PieceTable {
         let mut overlap = Vec::with_capacity(needle_len.saturating_sub(1));
         let mut window = Vec::new();
         let mut overlap_start = start;
-        let mut segment_start = start;
+        let mut overlap_position = start_pos;
         let mut found = None;
 
         self.pieces
-            .visit_range(start, self.total_len, |piece, local_start, local_end| {
-                if found.is_some() {
-                    return;
-                }
-
+            .visit_range_while(start, self.total_len, |piece, local_start, local_end| {
                 let seg_start = piece.start + local_start;
                 let seg_end = piece.start + local_end;
                 let src = self.source_bytes(piece.src);
                 let segment = &src[seg_start..seg_end];
                 if segment.is_empty() {
-                    return;
+                    return true;
                 }
 
                 let overlap_len = overlap.len();
                 refill_search_window(&mut window, &overlap, segment);
                 if let Some(rel) = find_window_match(finder, &window, overlap_len, needle_len) {
-                    found = Some(overlap_start.saturating_add(rel));
+                    let match_position = if rel == 0 {
+                        overlap_position
+                    } else {
+                        advance_position_by_bytes(overlap_position, &window[..rel])
+                    };
+                    found = Some((match_position, overlap_start.saturating_add(rel)));
+                    return false;
                 }
 
-                segment_start = segment_start.saturating_add(segment.len());
                 let keep = needle_len.saturating_sub(1).min(window.len());
+                let consumed = window.len().saturating_sub(keep);
+                if consumed > 0 {
+                    overlap_position =
+                        advance_position_by_bytes(overlap_position, &window[..consumed]);
+                }
                 overlap.clear();
                 overlap.extend_from_slice(&window[window.len().saturating_sub(keep)..]);
-                overlap_start = segment_start.saturating_sub(overlap.len());
+                overlap_start = overlap_start.saturating_add(consumed);
+                true
             });
 
         found
@@ -668,11 +1348,10 @@ impl PieceTable {
 
         let mut overlap = Vec::with_capacity(needle_len.saturating_sub(1));
         let mut window = Vec::new();
-        let mut overlap_start = 0usize;
-        let mut segment_end = 0usize;
+        let mut segment_end = end.min(self.total_len);
         let mut found = None;
 
-        self.pieces.visit_range(
+        self.pieces.visit_range_rev_while(
             0,
             end.min(self.total_len),
             |piece, local_start, local_end| {
@@ -681,20 +1360,23 @@ impl PieceTable {
                 let src = self.source_bytes(piece.src);
                 let segment = &src[seg_start..seg_end];
                 if segment.is_empty() {
-                    return;
+                    return true;
                 }
 
-                let overlap_len = overlap.len();
-                refill_search_window(&mut window, &overlap, segment);
-                if let Some(rel) = find_window_match_rev(finder, &window, overlap_len, needle_len) {
-                    found = Some(overlap_start.saturating_add(rel));
+                let segment_start = segment_end.saturating_sub(segment.len());
+                window.clear();
+                window.extend_from_slice(segment);
+                window.extend_from_slice(&overlap);
+                if let Some(rel) = finder.rfind_iter(&window).find(|&rel| rel < segment.len()) {
+                    found = Some(segment_start.saturating_add(rel));
+                    return false;
                 }
 
-                segment_end = segment_end.saturating_add(segment.len());
                 let keep = needle_len.saturating_sub(1).min(window.len());
                 overlap.clear();
-                overlap.extend_from_slice(&window[window.len().saturating_sub(keep)..]);
-                overlap_start = segment_end.saturating_sub(overlap.len());
+                overlap.extend_from_slice(&window[..keep]);
+                segment_end = segment_start;
+                true
             },
         );
 

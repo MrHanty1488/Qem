@@ -1,4 +1,8 @@
 use super::*;
+use crate::{
+    CompactionPolicy, CompactionRecommendation, DocumentMaintenanceStatus, FragmentationStats,
+    IdleCompactionOutcome, LiteralSearchIter, MaintenanceAction,
+};
 
 /// Backend-first document session wrapper with async open/save helpers and no
 /// GUI-level cursor or widget assumptions.
@@ -252,6 +256,59 @@ impl DocumentSession {
         self.core.document().read_selection(selection)
     }
 
+    /// Returns current piece-table fragmentation metrics.
+    pub fn fragmentation_stats(&self) -> Option<FragmentationStats> {
+        self.core.document().fragmentation_stats()
+    }
+
+    /// Returns fragmentation metrics using a caller-provided small-piece threshold.
+    pub fn fragmentation_stats_with_threshold(
+        &self,
+        small_piece_threshold_bytes: usize,
+    ) -> Option<FragmentationStats> {
+        self.core
+            .document()
+            .fragmentation_stats_with_threshold(small_piece_threshold_bytes)
+    }
+
+    /// Returns a piece-table compaction recommendation using the default policy.
+    pub fn compaction_recommendation(&self) -> Option<CompactionRecommendation> {
+        self.core.document().compaction_recommendation()
+    }
+
+    /// Returns a piece-table compaction recommendation using a caller policy.
+    pub fn compaction_recommendation_with_policy(
+        &self,
+        policy: CompactionPolicy,
+    ) -> Option<CompactionRecommendation> {
+        self.core
+            .document()
+            .compaction_recommendation_with_policy(policy)
+    }
+
+    /// Returns a maintenance-focused snapshot using the default compaction policy.
+    pub fn maintenance_status(&self) -> DocumentMaintenanceStatus {
+        self.core.document().maintenance_status()
+    }
+
+    /// Returns the high-level maintenance action suggested by the default policy.
+    pub fn maintenance_action(&self) -> MaintenanceAction {
+        self.core.document().maintenance_action()
+    }
+
+    /// Returns a maintenance-focused snapshot using a caller-provided compaction policy.
+    pub fn maintenance_status_with_policy(
+        &self,
+        policy: CompactionPolicy,
+    ) -> DocumentMaintenanceStatus {
+        self.core.document().maintenance_status_with_policy(policy)
+    }
+
+    /// Returns the high-level maintenance action suggested by a caller-provided policy.
+    pub fn maintenance_action_with_policy(&self, policy: CompactionPolicy) -> MaintenanceAction {
+        self.core.document().maintenance_action_with_policy(policy)
+    }
+
     /// Finds the next literal match starting at `from`.
     pub fn find_next(&self, needle: &str, from: TextPosition) -> Option<SearchMatch> {
         self.core.document().find_next(needle, from)
@@ -280,14 +337,106 @@ impl DocumentSession {
         self.core.document().find_prev_query(query, before)
     }
 
+    /// Iterates non-overlapping literal matches in the whole document.
+    pub fn find_all(&self, needle: impl Into<String>) -> LiteralSearchIter<'_> {
+        self.core.document().find_all(needle)
+    }
+
+    /// Iterates non-overlapping literal matches in the whole document using a
+    /// reusable compiled query.
+    pub fn find_all_query(&self, query: &LiteralSearchQuery) -> LiteralSearchIter<'_> {
+        self.core.document().find_all_query(query)
+    }
+
+    /// Iterates non-overlapping literal matches from `from` onward.
+    pub fn find_all_from(
+        &self,
+        needle: impl Into<String>,
+        from: TextPosition,
+    ) -> LiteralSearchIter<'_> {
+        self.core.document().find_all_from(needle, from)
+    }
+
+    /// Iterates non-overlapping literal matches from `from` onward using a
+    /// reusable compiled query.
+    pub fn find_all_query_from(
+        &self,
+        query: &LiteralSearchQuery,
+        from: TextPosition,
+    ) -> LiteralSearchIter<'_> {
+        self.core.document().find_all_query_from(query, from)
+    }
+
+    /// Iterates non-overlapping literal matches fully contained within `range`.
+    pub fn find_all_in_range(
+        &self,
+        needle: impl Into<String>,
+        range: TextRange,
+    ) -> LiteralSearchIter<'_> {
+        self.core.document().find_all_in_range(needle, range)
+    }
+
+    /// Iterates non-overlapping literal matches fully contained within `range`
+    /// using a reusable compiled query.
+    pub fn find_all_query_in_range(
+        &self,
+        query: &LiteralSearchQuery,
+        range: TextRange,
+    ) -> LiteralSearchIter<'_> {
+        self.core.document().find_all_query_in_range(query, range)
+    }
+
+    /// Iterates non-overlapping literal matches between two typed positions.
+    pub fn find_all_between(
+        &self,
+        needle: impl Into<String>,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> LiteralSearchIter<'_> {
+        self.core.document().find_all_between(needle, start, end)
+    }
+
+    /// Iterates non-overlapping literal matches between two typed positions
+    /// using a reusable compiled query.
+    pub fn find_all_query_between(
+        &self,
+        query: &LiteralSearchQuery,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> LiteralSearchIter<'_> {
+        self.core
+            .document()
+            .find_all_query_between(query, start, end)
+    }
+
     /// Finds the first literal match fully contained within `range`.
     pub fn find_next_in_range(&self, needle: &str, range: TextRange) -> Option<SearchMatch> {
         self.core.document().find_next_in_range(needle, range)
     }
 
+    /// Finds the first literal match fully contained between two typed positions.
+    pub fn find_next_between(
+        &self,
+        needle: &str,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> Option<SearchMatch> {
+        self.core.document().find_next_between(needle, start, end)
+    }
+
     /// Finds the last literal match fully contained within `range`.
     pub fn find_prev_in_range(&self, needle: &str, range: TextRange) -> Option<SearchMatch> {
         self.core.document().find_prev_in_range(needle, range)
+    }
+
+    /// Finds the last literal match fully contained between two typed positions.
+    pub fn find_prev_between(
+        &self,
+        needle: &str,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> Option<SearchMatch> {
+        self.core.document().find_prev_between(needle, start, end)
     }
 
     /// Finds the first query match fully contained within `range`.
@@ -299,6 +448,18 @@ impl DocumentSession {
         self.core.document().find_next_query_in_range(query, range)
     }
 
+    /// Finds the first query match fully contained between two typed positions.
+    pub fn find_next_query_between(
+        &self,
+        query: &LiteralSearchQuery,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> Option<SearchMatch> {
+        self.core
+            .document()
+            .find_next_query_between(query, start, end)
+    }
+
     /// Finds the last query match fully contained within `range`.
     pub fn find_prev_query_in_range(
         &self,
@@ -306,6 +467,78 @@ impl DocumentSession {
         range: TextRange,
     ) -> Option<SearchMatch> {
         self.core.document().find_prev_query_in_range(query, range)
+    }
+
+    /// Finds the last query match fully contained between two typed positions.
+    pub fn find_prev_query_between(
+        &self,
+        query: &LiteralSearchQuery,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> Option<SearchMatch> {
+        self.core
+            .document()
+            .find_prev_query_between(query, start, end)
+    }
+
+    /// Compacts the current piece-table document if one is active.
+    pub fn compact_piece_table(&mut self) -> Result<bool, DocumentError> {
+        self.core.ensure_idle_for_edit()?;
+        let path = self
+            .core
+            .document()
+            .path()
+            .map(|path| path.to_path_buf())
+            .unwrap_or_default();
+        self.core
+            .document_mut()
+            .compact_piece_table()
+            .map_err(|source| DocumentError::Write { path, source })
+    }
+
+    /// Compacts the current piece-table document when the policy recommends it.
+    pub fn compact_piece_table_if_recommended(
+        &mut self,
+        policy: CompactionPolicy,
+    ) -> Result<Option<CompactionRecommendation>, DocumentError> {
+        self.core.ensure_idle_for_edit()?;
+        let path = self
+            .core
+            .document()
+            .path()
+            .map(|path| path.to_path_buf())
+            .unwrap_or_default();
+        self.core
+            .document_mut()
+            .compact_piece_table_if_recommended(policy)
+            .map_err(|source| DocumentError::Write { path, source })
+    }
+
+    /// Runs a deferred idle compaction pass with the default policy.
+    pub fn run_idle_compaction(&mut self) -> Result<IdleCompactionOutcome, DocumentError> {
+        self.run_idle_compaction_with_policy(CompactionPolicy::default())
+    }
+
+    /// Runs a deferred idle compaction pass using a caller-provided policy.
+    ///
+    /// Forced recommendations are surfaced as `ForcedPending` without
+    /// rewriting the piece table, which lets the caller reserve that heavier
+    /// maintenance step for an explicit save or operator action.
+    pub fn run_idle_compaction_with_policy(
+        &mut self,
+        policy: CompactionPolicy,
+    ) -> Result<IdleCompactionOutcome, DocumentError> {
+        self.core.ensure_idle_for_edit()?;
+        let path = self
+            .core
+            .document()
+            .path()
+            .map(|path| path.to_path_buf())
+            .unwrap_or_default();
+        self.core
+            .document_mut()
+            .run_idle_compaction_with_policy(policy)
+            .map_err(|source| DocumentError::Write { path, source })
     }
 
     /// Applies a typed insert directly through the session.

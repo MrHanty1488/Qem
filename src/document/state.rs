@@ -16,6 +16,28 @@ impl Document {
         self.piece_table.is_some()
     }
 
+    /// Returns piece-table fragmentation metrics for edited large-file documents.
+    ///
+    /// Returns `None` unless the document is currently backed by a piece table.
+    pub fn fragmentation_stats(&self) -> Option<FragmentationStats> {
+        self.piece_table
+            .as_ref()
+            .map(PieceTable::fragmentation_stats)
+    }
+
+    /// Returns piece-table fragmentation metrics using a caller-provided small-piece threshold.
+    ///
+    /// The threshold is applied in bytes and controls which pieces contribute to
+    /// [`FragmentationStats::fragmentation_ratio`].
+    pub fn fragmentation_stats_with_threshold(
+        &self,
+        small_piece_threshold_bytes: usize,
+    ) -> Option<FragmentationStats> {
+        self.piece_table.as_ref().map(|piece_table| {
+            piece_table.fragmentation_stats_with_threshold(small_piece_threshold_bytes)
+        })
+    }
+
     /// Returns `true` if the engine knows the exact length of every line.
     pub fn has_precise_line_lengths(&self) -> bool {
         if self.rope.is_some() {
@@ -300,6 +322,38 @@ impl Document {
             self.indexing_state(),
             self.backing(),
         )
+    }
+
+    /// Returns a maintenance-focused snapshot using the default compaction policy.
+    ///
+    /// This is intentionally separate from [`Document::status`] because
+    /// fragmentation and compaction advice may require traversing piece-table
+    /// state and are heavier than ordinary frontend polling fields.
+    pub fn maintenance_status(&self) -> DocumentMaintenanceStatus {
+        self.maintenance_status_with_policy(CompactionPolicy::default())
+    }
+
+    /// Returns the high-level maintenance action suggested by the default policy.
+    pub fn maintenance_action(&self) -> MaintenanceAction {
+        self.maintenance_status().recommended_action()
+    }
+
+    /// Returns a maintenance-focused snapshot using a caller-provided compaction policy.
+    pub fn maintenance_status_with_policy(
+        &self,
+        policy: CompactionPolicy,
+    ) -> DocumentMaintenanceStatus {
+        DocumentMaintenanceStatus::new(
+            self.backing(),
+            self.fragmentation_stats_with_threshold(policy.small_piece_threshold_bytes),
+            self.compaction_recommendation_with_policy(policy),
+        )
+    }
+
+    /// Returns the high-level maintenance action suggested by a caller-provided policy.
+    pub fn maintenance_action_with_policy(&self, policy: CompactionPolicy) -> MaintenanceAction {
+        self.maintenance_status_with_policy(policy)
+            .recommended_action()
     }
 
     /// Returns the current document length in bytes.

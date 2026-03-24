@@ -12,6 +12,7 @@ use crate::index::DiskLineIndex;
 use crate::piece_tree::{editlog_path, Piece, PieceSource, PieceTree, SessionMeta};
 
 mod commands;
+mod compaction;
 mod editing;
 mod lifecycle;
 mod persistence;
@@ -21,15 +22,20 @@ mod search;
 mod state;
 mod types;
 
+pub use crate::piece_tree::FragmentationStats;
+pub use compaction::{
+    CompactionPolicy, CompactionRecommendation, CompactionUrgency, IdleCompactionOutcome,
+};
 #[cfg(feature = "editor")]
 pub(crate) use lifecycle::OpenProgressPhase;
 #[cfg(feature = "editor")]
 pub(crate) use persistence::{PreparedSave, SaveCompletion};
-pub use search::LiteralSearchQuery;
+pub use search::{LiteralSearchIter, LiteralSearchQuery};
 pub use types::{
-    ByteProgress, CutResult, DocumentBacking, DocumentError, DocumentStatus, EditCapability,
-    EditResult, LineCount, LineSlice, SearchMatch, TextPosition, TextRange, TextSelection,
-    TextSlice, Viewport, ViewportRequest, ViewportRow,
+    ByteProgress, CutResult, DocumentBacking, DocumentError, DocumentMaintenanceStatus,
+    DocumentStatus, EditCapability, EditResult, LineCount, LineSlice, MaintenanceAction,
+    SearchMatch, TextPosition, TextRange, TextSelection, TextSlice, Viewport, ViewportRequest,
+    ViewportRow,
 };
 
 // Hard limits to keep mmap indexing bounded for huge files.
@@ -999,6 +1005,18 @@ impl PieceTable {
         self.full_index
     }
 
+    pub(crate) fn fragmentation_stats(&self) -> FragmentationStats {
+        self.pieces.fragmentation_stats()
+    }
+
+    pub(crate) fn fragmentation_stats_with_threshold(
+        &self,
+        small_piece_threshold_bytes: usize,
+    ) -> FragmentationStats {
+        self.pieces
+            .fragmentation_stats_with_threshold(small_piece_threshold_bytes)
+    }
+
     fn session_meta(&self) -> SessionMeta {
         SessionMeta {
             known_byte_len: self.known_byte_len,
@@ -1046,7 +1064,11 @@ impl PieceTable {
                 self.pending_session_edits = 0;
                 self.last_session_flush = None;
                 self.pieces.detach_persistence();
-                Err(err)
+                if force {
+                    Err(err)
+                } else {
+                    Ok(())
+                }
             }
         }
     }

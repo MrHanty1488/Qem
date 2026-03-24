@@ -900,6 +900,337 @@ fn piece_table_insert_after_escaped_multibyte_char_preserves_boundaries() {
 }
 
 #[test]
+fn piece_table_fragmentation_stats_track_piece_growth_after_edit() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fragmentation.txt");
+    std::fs::write(&path, "abcdef").unwrap();
+
+    let storage = FileStorage::open(&path).unwrap();
+    let mut piece_table = PieceTable::new(storage, vec![6], true);
+
+    let before = piece_table.fragmentation_stats_with_threshold(2);
+    assert_eq!(before.piece_count, 1);
+    assert_eq!(before.total_bytes, 6);
+    assert_eq!(before.small_piece_count, 0);
+    assert_eq!(before.small_piece_bytes, 0);
+
+    piece_table.insert_bytes(3, b"XY").unwrap();
+
+    let after = piece_table.fragmentation_stats_with_threshold(2);
+    assert_eq!(after.piece_count, 3);
+    assert_eq!(after.total_bytes, 8);
+    assert_eq!(after.small_piece_threshold_bytes, 2);
+    assert_eq!(after.small_piece_count, 1);
+    assert_eq!(after.small_piece_bytes, 2);
+    assert!((after.average_piece_bytes() - (8.0 / 3.0)).abs() < 1e-9);
+    assert!((after.fragmentation_ratio() - (1.0 / 3.0)).abs() < 1e-9);
+}
+
+#[test]
+fn piece_table_compaction_policy_recommends_deferred_for_fragmented_small_pieces() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fragmented.txt");
+    std::fs::write(&path, "abcdef").unwrap();
+
+    let storage = FileStorage::open(&path).unwrap();
+    let mut piece_table = PieceTable::new(storage, vec![6], true);
+    piece_table.insert_bytes(3, b"XY").unwrap();
+
+    let recommendation = piece_table.compaction_recommendation(CompactionPolicy {
+        min_total_bytes: 0,
+        min_piece_count: 3,
+        small_piece_threshold_bytes: 2,
+        max_average_piece_bytes: 4,
+        min_fragmentation_ratio: 0.3,
+        forced_piece_count: 8,
+        forced_fragmentation_ratio: 0.6,
+    });
+
+    let recommendation = recommendation.expect("expected deferred compaction recommendation");
+    assert_eq!(recommendation.urgency(), CompactionUrgency::Deferred);
+    assert_eq!(recommendation.stats().piece_count, 3);
+    assert_eq!(recommendation.stats().small_piece_count, 1);
+}
+
+#[test]
+fn piece_table_compaction_policy_recommends_forced_when_fragmentation_crosses_hard_threshold() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("forced-fragmented.txt");
+    std::fs::write(&path, "abcdef").unwrap();
+
+    let storage = FileStorage::open(&path).unwrap();
+    let mut piece_table = PieceTable::new(storage, vec![6], true);
+    piece_table.insert_bytes(1, b"X").unwrap();
+    piece_table.insert_bytes(3, b"Y").unwrap();
+    piece_table.insert_bytes(5, b"Z").unwrap();
+
+    let recommendation = piece_table.compaction_recommendation(CompactionPolicy {
+        min_total_bytes: 0,
+        min_piece_count: 5,
+        small_piece_threshold_bytes: 1,
+        max_average_piece_bytes: 4,
+        min_fragmentation_ratio: 0.2,
+        forced_piece_count: 7,
+        forced_fragmentation_ratio: 0.4,
+    });
+
+    let recommendation = recommendation.expect("expected forced compaction recommendation");
+    assert_eq!(recommendation.urgency(), CompactionUrgency::Forced);
+    assert_eq!(recommendation.stats().piece_count, 7);
+    assert_eq!(recommendation.stats().small_piece_count, 6);
+}
+
+#[test]
+fn piece_table_compaction_rewrites_current_state_without_new_undo_step() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("compact-current.txt");
+    std::fs::write(&path, "abcdef").unwrap();
+
+    let storage = FileStorage::open(&path).unwrap();
+    let mut piece_table = PieceTable::new(storage, vec![6], true);
+    piece_table.insert_bytes(1, b"X").unwrap();
+    piece_table.insert_bytes(3, b"Y").unwrap();
+    piece_table.insert_bytes(5, b"Z").unwrap();
+
+    let before_text = piece_table.to_string_lossy();
+    let before_stats = piece_table.fragmentation_stats_with_threshold(1);
+    assert_eq!(before_stats.piece_count, 7);
+
+    assert!(piece_table.compact_current_state().unwrap());
+
+    let after_stats = piece_table.fragmentation_stats_with_threshold(1);
+    assert_eq!(piece_table.to_string_lossy(), before_text);
+    assert_eq!(after_stats.piece_count, 1);
+    assert!(piece_table.full_index());
+    assert_eq!(piece_table.known_byte_len, piece_table.total_len());
+
+    assert!(piece_table.undo().unwrap());
+    assert_eq!(piece_table.to_string_lossy(), "aXbYcdef");
+    assert!(piece_table.redo().unwrap());
+    assert_eq!(piece_table.to_string_lossy(), before_text);
+}
+
+#[test]
+fn document_compact_piece_table_preserves_recovery_and_clears_recommendation() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("compact-recovery.txt");
+    let seed = "a".repeat(PIECE_TABLE_MIN_BYTES) + "abcdef";
+    std::fs::write(&path, seed).unwrap();
+
+    let storage = FileStorage::open(&path).unwrap();
+    let mut piece_table = PieceTable::new(storage, vec![PIECE_TABLE_MIN_BYTES + 6], true);
+    let base = PIECE_TABLE_MIN_BYTES;
+    piece_table.insert_bytes(base + 1, b"X").unwrap();
+    piece_table.insert_bytes(base + 3, b"Y").unwrap();
+    piece_table.insert_bytes(base + 5, b"Z").unwrap();
+
+    let before_text = piece_table.to_string_lossy();
+    let recommendation = piece_table.compaction_recommendation(CompactionPolicy {
+        min_total_bytes: 0,
+        min_piece_count: 5,
+        small_piece_threshold_bytes: 1,
+        max_average_piece_bytes: 4,
+        min_fragmentation_ratio: 0.2,
+        forced_piece_count: 7,
+        forced_fragmentation_ratio: 0.4,
+    });
+    assert!(recommendation.is_some());
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: None,
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: PIECE_TABLE_MIN_BYTES + 6,
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(1)),
+        line_ending: LineEnding::Lf,
+        rope: None,
+        piece_table: Some(piece_table),
+        dirty: true,
+    };
+
+    let applied = doc
+        .compact_piece_table_if_recommended(CompactionPolicy {
+            min_total_bytes: 0,
+            min_piece_count: 5,
+            small_piece_threshold_bytes: 1,
+            max_average_piece_bytes: 4,
+            min_fragmentation_ratio: 0.2,
+            forced_piece_count: 7,
+            forced_fragmentation_ratio: 0.4,
+        })
+        .unwrap();
+    assert!(applied.is_some());
+    assert_eq!(doc.text_lossy(), before_text);
+    assert!(doc
+        .compaction_recommendation_with_policy(CompactionPolicy {
+            min_total_bytes: 0,
+            min_piece_count: 5,
+            small_piece_threshold_bytes: 1,
+            max_average_piece_bytes: 4,
+            min_fragmentation_ratio: 0.2,
+            forced_piece_count: 7,
+            forced_fragmentation_ratio: 0.4,
+        })
+        .is_none());
+
+    doc.flush_session().unwrap();
+    let recovered = Document::open(&path).unwrap();
+    assert_eq!(recovered.text_lossy(), before_text);
+}
+
+#[test]
+fn idle_compaction_runs_for_deferred_recommendations() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("idle-deferred.txt");
+    let line = b"0000target\n";
+    let repeat = (1024 * 1024 / line.len()) + 64;
+    std::fs::write(&path, line.repeat(repeat)).unwrap();
+
+    let policy = CompactionPolicy {
+        min_total_bytes: 0,
+        min_piece_count: 2,
+        small_piece_threshold_bytes: usize::MAX,
+        max_average_piece_bytes: usize::MAX,
+        min_fragmentation_ratio: 0.0,
+        forced_piece_count: usize::MAX,
+        forced_fragmentation_ratio: 1.0,
+    };
+
+    let mut doc = Document::open(path).unwrap();
+    match doc.try_insert(TextPosition::new(0, 0), "[qem]") {
+        Ok(_) => {}
+        Err(DocumentError::Write { .. }) => return,
+        Err(err) => panic!("unexpected insert error: {err}"),
+    }
+    let before = doc
+        .fragmentation_stats()
+        .expect("fragmentation stats before idle compaction")
+        .piece_count();
+    assert!(before > 1);
+
+    let outcome = doc.run_idle_compaction_with_policy(policy).unwrap();
+    match outcome {
+        IdleCompactionOutcome::Compacted(recommendation) => {
+            assert_eq!(recommendation.urgency(), CompactionUrgency::Deferred);
+        }
+        other => panic!("unexpected idle compaction outcome: {other:?}"),
+    }
+
+    let after = doc
+        .fragmentation_stats()
+        .expect("fragmentation stats after idle compaction")
+        .piece_count();
+    assert_eq!(after, 1);
+}
+
+#[test]
+fn idle_compaction_reports_forced_threshold_without_rewriting_state() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("idle-forced.txt");
+    let line = b"0000target\n";
+    let repeat = (1024 * 1024 / line.len()) + 64;
+    std::fs::write(&path, line.repeat(repeat)).unwrap();
+
+    let policy = CompactionPolicy {
+        min_total_bytes: 0,
+        min_piece_count: 2,
+        small_piece_threshold_bytes: usize::MAX,
+        max_average_piece_bytes: usize::MAX,
+        min_fragmentation_ratio: 0.0,
+        forced_piece_count: 2,
+        forced_fragmentation_ratio: 0.0,
+    };
+
+    let mut doc = Document::open(path).unwrap();
+    match doc.try_insert(TextPosition::new(0, 0), "[qem]") {
+        Ok(_) => {}
+        Err(DocumentError::Write { .. }) => return,
+        Err(err) => panic!("unexpected insert error: {err}"),
+    }
+    let before = doc
+        .fragmentation_stats()
+        .expect("fragmentation stats before forced idle pass")
+        .piece_count();
+    assert!(before > 1);
+    assert_eq!(
+        doc.maintenance_action_with_policy(policy),
+        MaintenanceAction::ExplicitCompaction
+    );
+
+    let outcome = doc.run_idle_compaction_with_policy(policy).unwrap();
+    match outcome {
+        IdleCompactionOutcome::ForcedPending(recommendation) => {
+            assert_eq!(recommendation.urgency(), CompactionUrgency::Forced);
+        }
+        other => panic!("unexpected idle compaction outcome: {other:?}"),
+    }
+
+    let after = doc
+        .fragmentation_stats()
+        .expect("fragmentation stats after forced idle pass")
+        .piece_count();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn prepare_save_with_forced_compaction_policy_compacts_before_snapshotting() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("save-compact-source.txt");
+    let target = dir.path().join("save-compact-target.txt");
+    std::fs::write(&source, "abcdef").unwrap();
+
+    let storage = FileStorage::open(&source).unwrap();
+    let mut piece_table = PieceTable::new(storage, vec![6], true);
+    piece_table.insert_bytes(1, b"X").unwrap();
+    piece_table.insert_bytes(3, b"Y").unwrap();
+    piece_table.insert_bytes(5, b"Z").unwrap();
+
+    let expected_text = piece_table.to_string_lossy();
+    let policy = CompactionPolicy {
+        min_total_bytes: 0,
+        min_piece_count: 5,
+        small_piece_threshold_bytes: 1,
+        max_average_piece_bytes: 4,
+        min_fragmentation_ratio: 0.2,
+        forced_piece_count: 7,
+        forced_fragmentation_ratio: 0.4,
+    };
+
+    let mut doc = Document {
+        path: Some(source.clone()),
+        storage: None,
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: 6,
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(1)),
+        line_ending: LineEnding::Lf,
+        rope: None,
+        piece_table: Some(piece_table),
+        dirty: true,
+    };
+
+    let before = doc.fragmentation_stats_with_threshold(1).unwrap();
+    assert_eq!(before.piece_count, 7);
+
+    let prepared = doc.prepare_save_with_policy(&target, Some(policy)).unwrap();
+    let after = doc.fragmentation_stats_with_threshold(1).unwrap();
+    assert_eq!(after.piece_count, 1);
+
+    let completion = prepared.execute(Arc::new(AtomicU64::new(0))).unwrap();
+    doc.finish_save(completion.path, completion.reload_after_save)
+        .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), expected_text);
+}
+
+#[test]
 fn line_slices_match_exact_mmap_lines() {
     let dir = std::env::temp_dir().join(format!("qem-line-slices-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
@@ -1414,6 +1745,35 @@ fn editlog_flush_failure_surfaces_error_and_falls_back_to_memory() {
 }
 
 #[test]
+fn scheduled_editlog_flush_failure_does_not_rollback_piece_table_edit() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-doc-session-scheduled-failure-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("scheduled-failure.txt");
+    write_disk_backed_fixture(&path);
+
+    let mut doc = Document::open(path.clone()).unwrap();
+    let _ = doc.try_insert_text_at(0, 0, "123").unwrap();
+    let piece_table = doc.piece_table.as_mut().expect("piece table expected");
+    piece_table.pieces.poison_persistence_for_test();
+    piece_table.last_session_flush = Instant::now().checked_sub(Duration::from_secs(1));
+
+    let cursor = doc.try_insert_text_at(0, 3, "X").unwrap();
+    assert_eq!(cursor, (0, 4));
+    assert!(doc.text_lossy().starts_with("123Xabc\ndef\n"));
+    assert!(
+        doc.flush_session().is_ok(),
+        "scheduled flush failure should already detach persistence and keep future flushes in-memory"
+    );
+
+    clear_session_sidecar(&path);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn recovered_piece_table_session_supports_undo_and_redo() {
     let dir = std::env::temp_dir().join(format!("qem-doc-session-history-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
@@ -1830,6 +2190,27 @@ fn literal_search_finds_next_match_across_piece_table_boundary() {
 }
 
 #[test]
+fn literal_search_finds_next_match_from_nonzero_piece_table_anchor() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("search-piece-table-anchor.txt");
+    let line = "alpha target\n";
+    let repeat = (PIECE_TABLE_MIN_BYTES / line.len()).saturating_add(64);
+    std::fs::write(&path, line.repeat(repeat)).unwrap();
+
+    let mut doc = Document::open(&path).unwrap();
+    let _ = doc.try_insert(TextPosition::new(0, 0), "[qem]").unwrap();
+    let _ = doc.try_insert(TextPosition::new(1, 0), ">>").unwrap();
+    let _ = doc.try_insert(TextPosition::new(2, 0), ">>").unwrap();
+    assert_eq!(doc.backing(), DocumentBacking::PieceTable);
+
+    let found = doc.find_next("target", TextPosition::new(2, 2)).unwrap();
+
+    assert_eq!(found.start(), TextPosition::new(2, 8));
+    assert_eq!(found.end(), TextPosition::new(2, 14));
+    assert_eq!(doc.read_text(found.range()).text(), "target");
+}
+
+#[test]
 fn literal_search_finds_previous_match_with_end_before_boundary() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("search-prev-mmap.txt");
@@ -1873,6 +2254,66 @@ fn literal_search_bounded_range_returns_only_fully_contained_matches() {
     let query = LiteralSearchQuery::new("beta").unwrap();
     let compiled = doc.find_next_query_in_range(&query, range).unwrap();
     assert_eq!(compiled, next);
+
+    let between_next = doc
+        .find_next_between("beta", TextPosition::new(1, 0), TextPosition::new(3, 0))
+        .unwrap();
+    assert_eq!(between_next, next);
+
+    let between_prev = doc
+        .find_prev_query_between(&query, TextPosition::new(1, 0), TextPosition::new(3, 0))
+        .unwrap();
+    assert_eq!(between_prev, prev);
+}
+
+#[test]
+fn literal_search_iterator_yields_non_overlapping_matches() {
+    let mut doc = Document::new();
+    let _ = doc.try_insert(TextPosition::new(0, 0), "aaaa").unwrap();
+
+    let matches: Vec<_> = doc.find_all("aa").collect();
+    let query = LiteralSearchQuery::new("aa").unwrap();
+    let query_matches: Vec<_> = doc.find_all_query(&query).collect();
+
+    assert_eq!(matches.len(), 2);
+    assert_eq!(matches[0].start(), TextPosition::new(0, 0));
+    assert_eq!(matches[0].end(), TextPosition::new(0, 2));
+    assert_eq!(matches[1].start(), TextPosition::new(0, 2));
+    assert_eq!(matches[1].end(), TextPosition::new(0, 4));
+    assert_eq!(query_matches, matches);
+}
+
+#[test]
+fn literal_search_iterator_respects_piece_table_range_boundaries() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("search-iterator-piece-table.txt");
+    let line = "0000target\n";
+    let repeat = (PIECE_TABLE_MIN_BYTES / line.len()).saturating_add(64);
+    std::fs::write(&path, line.repeat(repeat)).unwrap();
+
+    let mut doc = Document::open(&path).unwrap();
+    let _ = doc.try_insert(TextPosition::new(0, 0), "[qem]").unwrap();
+    assert_eq!(doc.backing(), DocumentBacking::PieceTable);
+
+    let range = doc.text_range_between(TextPosition::new(0, 0), TextPosition::new(2, 0));
+    let matches: Vec<_> = doc.find_all_in_range("target", range).collect();
+    let between_matches: Vec<_> = doc
+        .find_all_between("target", TextPosition::new(0, 0), TextPosition::new(2, 0))
+        .collect();
+    let query = LiteralSearchQuery::new("target").unwrap();
+    let query_matches: Vec<_> = doc.find_all_query_in_range(&query, range).collect();
+    let query_between_matches: Vec<_> = doc
+        .find_all_query_between(&query, TextPosition::new(0, 0), TextPosition::new(2, 0))
+        .collect();
+
+    assert_eq!(matches.len(), 2);
+    assert_eq!(matches[0].start(), TextPosition::new(0, 9));
+    assert_eq!(matches[0].end(), TextPosition::new(0, 15));
+    assert_eq!(matches[1].start(), TextPosition::new(1, 4));
+    assert_eq!(matches[1].end(), TextPosition::new(1, 10));
+    assert_eq!(between_matches, matches);
+    assert_eq!(query_matches, matches);
+    assert_eq!(query_between_matches, matches);
 }
 
 #[test]
@@ -1935,6 +2376,64 @@ fn literal_search_finds_previous_match_across_piece_table_boundary() {
     assert!(doc
         .find_prev("[qem]0000target", TextPosition::new(0, 0))
         .is_none());
+}
+
+#[test]
+fn literal_search_finds_previous_match_from_nonzero_piece_table_anchor() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("search-prev-anchor-piece-table.txt");
+    let line = "0000target\n";
+    let repeat = (PIECE_TABLE_MIN_BYTES / line.len()).saturating_add(64);
+    std::fs::write(&path, line.repeat(repeat)).unwrap();
+
+    let mut doc = Document::open(&path).unwrap();
+    let _ = doc.try_insert(TextPosition::new(0, 0), "[qem]\n").unwrap();
+    assert_eq!(doc.backing(), DocumentBacking::PieceTable);
+
+    let before = TextPosition::new(1, 15);
+    let found = doc.find_prev("0000target", before).unwrap();
+
+    assert_eq!(found.start(), TextPosition::new(1, 0));
+    assert_eq!(found.end(), TextPosition::new(1, 10));
+}
+
+#[test]
+fn literal_search_finds_previous_same_line_piece_table_match_near_anchor() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("search-prev-same-line-piece-table.txt");
+    let line = "0000target\n";
+    let repeat = (PIECE_TABLE_MIN_BYTES / line.len()).saturating_add(64);
+    std::fs::write(&path, line.repeat(repeat)).unwrap();
+
+    let mut doc = Document::open(&path).unwrap();
+    let _ = doc.try_insert(TextPosition::new(0, 0), "[qem]").unwrap();
+    assert_eq!(doc.backing(), DocumentBacking::PieceTable);
+
+    let found = doc.find_prev("00", TextPosition::new(0, 10)).unwrap();
+    assert_eq!(found.start(), TextPosition::new(0, 7));
+    assert_eq!(found.end(), TextPosition::new(0, 9));
+}
+
+#[test]
+fn literal_search_finds_previous_piece_table_match_before_trailing_newline_anchor() {
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("search-prev-trailing-newline-piece-table.txt");
+    let line = "0000target\n";
+    let repeat = (PIECE_TABLE_MIN_BYTES / line.len()).saturating_add(64);
+    std::fs::write(&path, line.repeat(repeat)).unwrap();
+
+    let mut doc = Document::open(&path).unwrap();
+    let _ = doc.try_insert(TextPosition::new(0, 0), "[qem]\n").unwrap();
+    assert_eq!(doc.backing(), DocumentBacking::PieceTable);
+
+    let found = doc
+        .find_prev("00", TextPosition::new(usize::MAX, usize::MAX))
+        .unwrap();
+    let last_line0 = doc.line_count().display_rows().saturating_sub(2);
+    assert_eq!(found.start(), TextPosition::new(last_line0, 2));
+    assert_eq!(found.end(), TextPosition::new(last_line0, 4));
 }
 
 #[test]
@@ -2046,6 +2545,80 @@ fn document_status_reports_frontend_snapshot() {
     assert!(status.has_rope());
     assert!(!status.has_piece_table());
     assert!(!status.is_indexing());
+}
+
+#[test]
+fn document_maintenance_status_is_empty_for_non_piece_table_backings() {
+    let mut doc = Document::new();
+    let _ = doc
+        .try_insert(TextPosition::new(0, 0), "alpha\nbeta")
+        .unwrap();
+
+    let maintenance = doc.maintenance_status();
+
+    assert_eq!(maintenance.backing(), DocumentBacking::Rope);
+    assert!(!maintenance.has_piece_table());
+    assert!(!maintenance.has_fragmentation_stats());
+    assert_eq!(maintenance.fragmentation_stats(), None);
+    assert!(!maintenance.is_compaction_recommended());
+    assert_eq!(maintenance.compaction_recommendation(), None);
+    assert_eq!(maintenance.compaction_urgency(), None);
+    assert_eq!(maintenance.recommended_action(), MaintenanceAction::None);
+    assert!(!maintenance.should_run_idle_compaction());
+    assert!(!maintenance.should_wait_for_explicit_compaction());
+}
+
+#[test]
+fn document_maintenance_status_reports_piece_table_fragmentation_and_policy() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("large-piece-table.txt");
+    let line = b"0000target\n";
+    let repeat = (1024 * 1024 / line.len()) + 64;
+    std::fs::write(&path, line.repeat(repeat)).unwrap();
+
+    let policy = CompactionPolicy {
+        min_total_bytes: 0,
+        min_piece_count: 2,
+        small_piece_threshold_bytes: usize::MAX,
+        max_average_piece_bytes: usize::MAX,
+        min_fragmentation_ratio: 0.0,
+        forced_piece_count: usize::MAX,
+        forced_fragmentation_ratio: 1.0,
+    };
+
+    let mut doc = Document::open(path).unwrap();
+    match doc.try_insert(TextPosition::new(0, 0), "[qem]") {
+        Ok(_) => {}
+        Err(DocumentError::Write { .. }) => return,
+        Err(err) => panic!("unexpected insert error: {err}"),
+    }
+    assert_eq!(doc.backing(), DocumentBacking::PieceTable);
+
+    let maintenance = doc.maintenance_status_with_policy(policy);
+    let stats = maintenance
+        .fragmentation_stats()
+        .expect("piece-table maintenance stats");
+    let recommendation = maintenance
+        .compaction_recommendation()
+        .expect("piece-table maintenance recommendation");
+
+    assert_eq!(maintenance.backing(), DocumentBacking::PieceTable);
+    assert!(maintenance.has_piece_table());
+    assert!(maintenance.has_fragmentation_stats());
+    assert!(stats.piece_count() > 1);
+    assert!(maintenance.is_compaction_recommended());
+    assert_eq!(
+        maintenance.compaction_urgency(),
+        Some(CompactionUrgency::Deferred)
+    );
+    assert_eq!(recommendation.urgency(), CompactionUrgency::Deferred);
+    assert_eq!(recommendation.stats(), stats);
+    assert_eq!(
+        maintenance.recommended_action(),
+        MaintenanceAction::IdleCompaction
+    );
+    assert!(maintenance.should_run_idle_compaction());
+    assert!(!maintenance.should_wait_for_explicit_compaction());
 }
 
 #[test]

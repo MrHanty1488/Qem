@@ -254,7 +254,41 @@ impl Document {
         self.try_redo().unwrap_or(false)
     }
 
-    pub(crate) fn prepare_save(&self, path: &Path) -> PreparedSave {
+    fn maybe_force_compact_before_save_with_policy(
+        &mut self,
+        policy: CompactionPolicy,
+    ) -> Result<bool, DocumentError> {
+        let Some(recommendation) = self.compaction_recommendation_with_policy(policy) else {
+            return Ok(false);
+        };
+        if recommendation.urgency() != CompactionUrgency::Forced {
+            return Ok(false);
+        }
+
+        let doc_path = self.path.clone();
+        let sidecar_path = self.piece_table.as_ref().map(|piece_table| {
+            session_sidecar_path(doc_path.as_deref(), piece_table.original.path())
+        });
+        match self.compact_piece_table() {
+            Ok(compacted) => Ok(compacted),
+            Err(source) => Err(DocumentError::Write {
+                path: sidecar_path.unwrap_or_else(|| {
+                    doc_path.unwrap_or_else(|| PathBuf::from("<session-sidecar>"))
+                }),
+                source,
+            }),
+        }
+    }
+
+    pub(crate) fn prepare_save_with_policy(
+        &mut self,
+        path: &Path,
+        compaction_policy: Option<CompactionPolicy>,
+    ) -> Result<PreparedSave, DocumentError> {
+        if let Some(policy) = compaction_policy {
+            self.maybe_force_compact_before_save_with_policy(policy)?;
+        }
+
         let snapshot = if let Some(piece_table) = self.piece_table.as_ref() {
             SaveSnapshot::PieceTable(PieceTableSnapshot::from_piece_table(piece_table))
         } else if let Some(rope) = self.rope.as_ref() {
@@ -268,12 +302,16 @@ impl Document {
             SaveSnapshot::Empty
         };
 
-        PreparedSave {
+        Ok(PreparedSave {
             path: path.to_path_buf(),
             total_bytes: self.file_len() as u64,
             reload_after_save: !self.has_edit_buffer(),
             snapshot,
-        }
+        })
+    }
+
+    pub(crate) fn prepare_save(&mut self, path: &Path) -> Result<PreparedSave, DocumentError> {
+        self.prepare_save_with_policy(path, Some(CompactionPolicy::default()))
     }
 
     pub(crate) fn finish_save(
@@ -320,7 +358,7 @@ impl Document {
     /// Returns [`DocumentError`] if the file cannot be written, renamed, or
     /// reopened after the save completes.
     pub fn save_to(&mut self, path: &Path) -> Result<(), DocumentError> {
-        let prepared = self.prepare_save(path);
+        let prepared = self.prepare_save(path)?;
         let completion = prepared.execute(Arc::new(AtomicU64::new(0)))?;
         self.finish_save(completion.path, completion.reload_after_save)
     }

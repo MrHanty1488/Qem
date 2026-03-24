@@ -80,10 +80,23 @@
 //!    [`Document::try_cut_selection`], [`Document::try_backspace_selection`],
 //!    or [`Document::try_delete_forward_selection`]. Literal search is exposed
 //!    through [`Document::find_next`], [`Document::find_prev`],
-//!    [`Document::find_next_in_range`], [`Document::find_prev_in_range`],
-//!    [`LiteralSearchQuery`], and the session/tab wrappers as a typed
-//!    [`SearchMatch`]. Then save through [`Document::save_to`],
-//!    [`DocumentSession::save_async`], or [`DocumentSession::save_as_async`].
+//!    [`Document::find_all`], the compiled-query variants such as
+//!    [`Document::find_all_query`], the bounded range/position helpers, and
+//!    the session/tab wrappers as typed [`SearchMatch`] values.
+//! 10. For long-lived edited piece-table documents, prefer
+//!     [`Document::maintenance_status`] or
+//!     [`Document::maintenance_status_with_policy`] (or the session/tab
+//!     wrappers) when the caller wants one explicit maintenance snapshot.
+//!     [`Document::maintenance_action`] and
+//!     [`DocumentMaintenanceStatus::recommended_action`] provide a lighter
+//!     high-level decision when the frontend only needs to know whether to do
+//!     idle maintenance now or wait for an explicit boundary.
+//!     Run [`Document::run_idle_compaction`] or
+//!     [`Document::run_idle_compaction_with_policy`] during idle time for
+//!     deferred maintenance. Keep
+//!     [`Document::compact_piece_table`] for explicit maintenance actions.
+//! 11. Then save through [`Document::save_to`],
+//!     [`DocumentSession::save_async`], or [`DocumentSession::save_as_async`].
 //!
 //! ```no_run
 //! # #[cfg(not(feature = "editor"))]
@@ -134,14 +147,13 @@
 //!   [`DocumentSession`], the convenience cursor wrapper [`EditorTab`], and
 //!   the related progress/save helper types.
 //!
-//! # Current 0.4.x Contract
+//! # Current Contract
 //!
-//! - UTF-8 and ASCII text are the primary `0.4.x` path: open, viewport reads,
+//! - UTF-8 and ASCII text are the primary stable path: open, viewport reads,
 //!   edits, undo/redo, and saves are supported.
 //! - Non-UTF8 or invalid UTF-8 bytes can still be opened and inspected, but
 //!   text-facing APIs expose lossy UTF-8 views. Encoding-preserving edit/save
-//!   behavior for arbitrary legacy encodings is not yet a stable `0.4.x`
-//!   contract.
+//!   behavior for arbitrary legacy encodings is not yet a stable contract.
 //! - Huge files are supported for mmap-backed reads, viewport rendering, line
 //!   counting, and background indexing without full materialization. Editing
 //!   may be rejected when it would require rope materialization beyond the
@@ -162,7 +174,7 @@
 //!   Call [`DocumentSession::take_background_issue`] or
 //!   [`EditorTab::take_background_issue`] when your app wants to acknowledge
 //!   and clear that retained issue explicitly.
-//! - Deferred closes are part of the public session contract in `0.4.x`:
+//! - Deferred closes are part of the public session contract:
 //!   [`DocumentSession::close_pending`] and the corresponding status snapshot
 //!   expose when `close_file()` is waiting for an in-flight background job to
 //!   finish before the document can actually disappear.
@@ -176,9 +188,11 @@ pub(crate) mod source_identity;
 pub mod storage;
 
 pub use document::{
-    ByteProgress, CutResult, Document, DocumentBacking, DocumentError, DocumentStatus,
-    EditCapability, EditResult, LineCount, LineEnding, LineSlice, LiteralSearchQuery, SearchMatch,
-    TextPosition, TextRange, TextSelection, TextSlice, Viewport, ViewportRequest, ViewportRow,
+    ByteProgress, CompactionPolicy, CompactionRecommendation, CompactionUrgency, CutResult,
+    Document, DocumentBacking, DocumentError, DocumentMaintenanceStatus, DocumentStatus,
+    EditCapability, EditResult, FragmentationStats, IdleCompactionOutcome, LineCount, LineEnding,
+    LineSlice, LiteralSearchIter, LiteralSearchQuery, MaintenanceAction, SearchMatch, TextPosition,
+    TextRange, TextSelection, TextSlice, Viewport, ViewportRequest, ViewportRow,
 };
 #[cfg(feature = "editor")]
 pub use editor::{

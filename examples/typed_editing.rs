@@ -65,6 +65,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     print_viewport(&doc, "after edits");
+    let maintenance = doc.maintenance_status();
+    if let Some(stats) = maintenance.fragmentation_stats() {
+        println!(
+            "fragmentation: pieces={}, avg_bytes={:.1}, small_ratio={:.3}",
+            stats.piece_count(),
+            stats.average_piece_bytes(),
+            stats.fragmentation_ratio()
+        );
+    }
+    println!(
+        "maintenance action: {}",
+        maintenance.recommended_action().as_str()
+    );
+    if let Some(recommendation) = maintenance.compaction_recommendation() {
+        println!("compaction recommended: {:?}", recommendation.urgency());
+    }
+    let idle_outcome = doc.run_idle_compaction()?;
+    if idle_outcome.is_compacted() {
+        println!("idle maintenance compacted the piece table");
+    } else if idle_outcome.is_forced_pending() {
+        println!("idle maintenance left a forced compaction pending for save/operator action");
+    }
 
     if let Some(output) = output {
         doc.save_to(&output)?;

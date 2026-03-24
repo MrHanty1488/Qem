@@ -523,7 +523,7 @@ impl SessionCore {
             return Ok(false);
         }
 
-        let prepared = self.doc.prepare_save(&path);
+        let prepared = self.doc.prepare_save(&path)?;
         let total_bytes = prepared.total_bytes();
         let written_bytes = Arc::new(AtomicU64::new(0));
         let rx = spawn_save_worker(prepared, Arc::clone(&written_bytes));

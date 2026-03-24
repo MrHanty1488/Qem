@@ -52,6 +52,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TextPosition::new(0, 0),
             "// saved by qem frontend_session example\n",
         )?;
+        let maintenance = session.maintenance_status();
+        if let Some(stats) = maintenance.fragmentation_stats() {
+            println!(
+                "fragmentation: pieces={}, avg_bytes={:.1}, small_ratio={:.3}",
+                stats.piece_count(),
+                stats.average_piece_bytes(),
+                stats.fragmentation_ratio()
+            );
+        }
+        println!(
+            "maintenance action: {}",
+            maintenance.recommended_action().as_str()
+        );
+        if let Some(recommendation) = maintenance.compaction_recommendation() {
+            println!("compaction recommended: {:?}", recommendation.urgency());
+        }
+        let idle_outcome = session.run_idle_compaction()?;
+        if idle_outcome.is_compacted() {
+            println!("idle maintenance compacted the piece table");
+        } else if idle_outcome.is_forced_pending() {
+            println!("idle maintenance left a forced compaction pending for save/operator action");
+        }
 
         if session.save_as_async(output.clone())? {
             wait_for_save(&mut session, Duration::from_secs(5))?;

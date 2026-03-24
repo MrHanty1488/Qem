@@ -1,4 +1,4 @@
-use super::LineEnding;
+use super::{CompactionRecommendation, CompactionUrgency, FragmentationStats, LineEnding};
 use std::fmt;
 use std::io;
 use std::ops::Deref;
@@ -745,6 +745,108 @@ impl DocumentStatus {
     /// Returns `true` when the document is currently backed by a piece table.
     pub fn has_piece_table(&self) -> bool {
         matches!(self.backing, DocumentBacking::PieceTable)
+    }
+}
+
+/// Snapshot of maintenance-oriented document state such as fragmentation and
+/// compaction advice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DocumentMaintenanceStatus {
+    backing: DocumentBacking,
+    fragmentation: Option<FragmentationStats>,
+    compaction: Option<CompactionRecommendation>,
+}
+
+/// High-level maintenance action suggested by the current compaction policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceAction {
+    /// No maintenance work is currently recommended.
+    None,
+    /// The frontend can run idle compaction now.
+    IdleCompaction,
+    /// Heavier maintenance should wait for an explicit operator/save boundary.
+    ExplicitCompaction,
+}
+
+impl MaintenanceAction {
+    /// Returns a stable lowercase identifier for logs, JSON output, or UI glue.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::IdleCompaction => "idle-compaction",
+            Self::ExplicitCompaction => "explicit-compaction",
+        }
+    }
+}
+
+impl DocumentMaintenanceStatus {
+    /// Creates a maintenance status snapshot.
+    pub const fn new(
+        backing: DocumentBacking,
+        fragmentation: Option<FragmentationStats>,
+        compaction: Option<CompactionRecommendation>,
+    ) -> Self {
+        Self {
+            backing,
+            fragmentation,
+            compaction,
+        }
+    }
+
+    /// Returns the current document backing mode.
+    pub const fn backing(self) -> DocumentBacking {
+        self.backing
+    }
+
+    /// Returns `true` when the document currently uses a piece table.
+    pub const fn has_piece_table(self) -> bool {
+        matches!(self.backing, DocumentBacking::PieceTable)
+    }
+
+    /// Returns fragmentation metrics when they are meaningful for the current backing.
+    pub const fn fragmentation_stats(self) -> Option<FragmentationStats> {
+        self.fragmentation
+    }
+
+    /// Returns `true` when fragmentation metrics are available.
+    pub const fn has_fragmentation_stats(self) -> bool {
+        self.fragmentation.is_some()
+    }
+
+    /// Returns the current compaction recommendation, if any.
+    pub const fn compaction_recommendation(self) -> Option<CompactionRecommendation> {
+        self.compaction
+    }
+
+    /// Returns `true` when the current maintenance policy recommends compaction.
+    pub const fn is_compaction_recommended(self) -> bool {
+        self.compaction.is_some()
+    }
+
+    /// Returns the current compaction urgency, if a recommendation exists.
+    pub fn compaction_urgency(self) -> Option<CompactionUrgency> {
+        self.compaction
+            .map(|recommendation| recommendation.urgency())
+    }
+
+    /// Returns the high-level maintenance action implied by this snapshot.
+    pub fn recommended_action(self) -> MaintenanceAction {
+        match self.compaction_urgency() {
+            Some(CompactionUrgency::Deferred) => MaintenanceAction::IdleCompaction,
+            Some(CompactionUrgency::Forced) => MaintenanceAction::ExplicitCompaction,
+            None => MaintenanceAction::None,
+        }
+    }
+
+    /// Returns `true` when idle compaction is currently recommended.
+    pub fn should_run_idle_compaction(self) -> bool {
+        self.recommended_action() == MaintenanceAction::IdleCompaction
+    }
+
+    /// Returns `true` when heavier maintenance should be deferred to an
+    /// explicit operator/save boundary.
+    pub fn should_wait_for_explicit_compaction(self) -> bool {
+        self.recommended_action() == MaintenanceAction::ExplicitCompaction
     }
 }
 

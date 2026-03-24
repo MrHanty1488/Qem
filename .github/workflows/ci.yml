@@ -81,6 +81,8 @@ jobs:
             command: cargo build --example viewport --no-default-features
           - name: cargo build --example typed_editing --no-default-features
             command: cargo build --example typed_editing --no-default-features
+          - name: cargo build --example perf_probe --no-default-features
+            command: cargo build --example perf_probe --no-default-features
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -96,6 +98,38 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo bench --bench document_perf --no-run
         run: cargo bench --bench document_perf --no-run
+
+  perf-tools:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --example perf_probe
+        run: cargo build --example perf_probe
+      - name: collect perf matrix smoke
+        shell: pwsh
+        run: >
+          .\scripts\collect_perf_matrix.ps1 README.md
+          -Needle e
+          -FindAllLimit 4
+          -States clean,edited
+          -Repeats 1
+          -WaitSecs 0
+          -SkipBuild
+          -MatrixLabel ci
+          -OutputJsonl target\perf-matrix-ci.jsonl
+      - name: summarize perf matrix smoke
+        shell: pwsh
+        run: >
+          .\scripts\summarize_perf_matrix.ps1
+          -InputJsonl target\perf-matrix-ci.jsonl
+          -OutputMarkdown target\perf-matrix-ci-summary.md
+      - name: verify perf matrix artifacts
+        shell: pwsh
+        run: |
+          if (!(Test-Path target\perf-matrix-ci.jsonl)) { throw "missing target\\perf-matrix-ci.jsonl" }
+          if (!(Test-Path target\perf-matrix-ci-summary.md)) { throw "missing target\\perf-matrix-ci-summary.md" }
 
   msrv:
     runs-on: ubuntu-latest

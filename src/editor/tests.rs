@@ -3,7 +3,8 @@ use super::{
     SaveError,
 };
 use crate::{
-    DocumentBacking, EditCapability, LiteralSearchQuery, TextPosition, TextSelection,
+    CompactionPolicy, CompactionUrgency, DocumentBacking, DocumentError, EditCapability,
+    IdleCompactionOutcome, LiteralSearchQuery, MaintenanceAction, TextPosition, TextSelection,
     ViewportRequest,
 };
 use std::fs;
@@ -95,6 +96,294 @@ fn session_and_tab_find_next_delegate_to_document_search() {
     let tab_bounded = tab.find_prev_query_in_range(&query, range).unwrap();
     assert_eq!(tab_bounded.start(), TextPosition::new(1, 0));
     assert_eq!(tab_bounded.end(), TextPosition::new(1, 4));
+
+    let session_between = session
+        .find_next_between("beta", TextPosition::new(1, 0), TextPosition::new(3, 0))
+        .unwrap();
+    assert_eq!(session_between.start(), TextPosition::new(1, 0));
+    assert_eq!(session_between.end(), TextPosition::new(1, 4));
+
+    let tab_between = tab
+        .find_prev_query_between(&query, TextPosition::new(1, 0), TextPosition::new(3, 0))
+        .unwrap();
+    assert_eq!(tab_between.start(), TextPosition::new(1, 0));
+    assert_eq!(tab_between.end(), TextPosition::new(1, 4));
+
+    let session_all: Vec<_> = session.find_all("beta").collect();
+    assert_eq!(session_all.len(), 2);
+    assert_eq!(session_all[0].start(), TextPosition::new(1, 0));
+    assert_eq!(session_all[1].start(), TextPosition::new(3, 0));
+
+    let session_all_query: Vec<_> = session.find_all_query(&query).collect();
+    assert_eq!(session_all_query, session_all);
+
+    let tab_all_in_range: Vec<_> = tab.find_all_in_range("beta", range).collect();
+    assert_eq!(tab_all_in_range.len(), 1);
+    assert_eq!(tab_all_in_range[0].start(), TextPosition::new(1, 0));
+
+    let tab_all_query_in_range: Vec<_> = tab.find_all_query_in_range(&query, range).collect();
+    assert_eq!(tab_all_query_in_range, tab_all_in_range);
+
+    let session_all_between: Vec<_> = session
+        .find_all_between("beta", TextPosition::new(1, 0), TextPosition::new(3, 0))
+        .collect();
+    assert_eq!(session_all_between.len(), 1);
+    assert_eq!(session_all_between[0].start(), TextPosition::new(1, 0));
+
+    let tab_all_query_between: Vec<_> = tab
+        .find_all_query_between(&query, TextPosition::new(1, 0), TextPosition::new(3, 0))
+        .collect();
+    assert_eq!(tab_all_query_between, session_all_between);
+}
+
+#[test]
+fn session_and_tab_compaction_wrappers_delegate_to_document() {
+    let dir = std::env::temp_dir().join(format!("qem-editor-compaction-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("large-piece-table.txt");
+    let line = b"0000target\n";
+    let repeat = (1024 * 1024 / line.len()) + 64;
+    fs::write(&path, line.repeat(repeat)).unwrap();
+
+    let policy = CompactionPolicy {
+        min_total_bytes: 0,
+        min_piece_count: 2,
+        small_piece_threshold_bytes: usize::MAX,
+        max_average_piece_bytes: usize::MAX,
+        min_fragmentation_ratio: 0.0,
+        forced_piece_count: usize::MAX,
+        forced_fragmentation_ratio: 1.0,
+    };
+
+    let mut session = DocumentSession::new();
+    session.open_file(path.clone()).unwrap();
+    match session.try_insert(TextPosition::new(0, 0), "[qem]") {
+        Ok(_) => {}
+        Err(DocumentError::Write { .. }) => {}
+        Err(err) => panic!("unexpected session insert error: {err}"),
+    }
+    assert_eq!(session.document().backing(), DocumentBacking::PieceTable);
+    assert!(
+        session
+            .fragmentation_stats()
+            .expect("session piece-table stats")
+            .piece_count()
+            > 1
+    );
+    let session_recommendation = session
+        .compaction_recommendation_with_policy(policy)
+        .expect("session should recommend compaction");
+    assert_eq!(
+        session_recommendation.urgency(),
+        CompactionUrgency::Deferred
+    );
+    let compacted = session
+        .compact_piece_table_if_recommended(policy)
+        .map(|result| result.expect("session compaction should run"));
+    match compacted {
+        Ok(recommendation) => assert_eq!(recommendation.urgency(), CompactionUrgency::Deferred),
+        Err(DocumentError::Write { .. }) => {}
+        Err(err) => panic!("unexpected session compaction error: {err}"),
+    }
+    assert_eq!(
+        session
+            .fragmentation_stats()
+            .expect("session compacted stats")
+            .piece_count(),
+        1
+    );
+
+    let mut tab = EditorTab::new(7);
+    tab.open_file(path.clone()).unwrap();
+    match tab.try_insert(TextPosition::new(0, 0), "[qem]") {
+        Ok(_) => {}
+        Err(DocumentError::Write { .. }) => {}
+        Err(err) => panic!("unexpected tab insert error: {err}"),
+    }
+    assert_eq!(tab.document().backing(), DocumentBacking::PieceTable);
+    assert!(
+        tab.fragmentation_stats()
+            .expect("tab piece-table stats")
+            .piece_count()
+            > 1
+    );
+    let tab_recommendation = tab
+        .compaction_recommendation_with_policy(policy)
+        .expect("tab should recommend compaction");
+    assert_eq!(tab_recommendation.urgency(), CompactionUrgency::Deferred);
+    match tab.compact_piece_table() {
+        Ok(compacted) => assert!(compacted),
+        Err(DocumentError::Write { .. }) => {}
+        Err(err) => panic!("unexpected tab compaction error: {err}"),
+    }
+    assert_eq!(
+        tab.fragmentation_stats()
+            .expect("tab compacted stats")
+            .piece_count(),
+        1
+    );
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_and_tab_maintenance_status_wrappers_delegate_to_document() {
+    let dir = std::env::temp_dir().join(format!("qem-editor-maintenance-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("large-piece-table.txt");
+    let line = b"0000target\n";
+    let repeat = (1024 * 1024 / line.len()) + 64;
+    fs::write(&path, line.repeat(repeat)).unwrap();
+
+    let policy = CompactionPolicy {
+        min_total_bytes: 0,
+        min_piece_count: 2,
+        small_piece_threshold_bytes: usize::MAX,
+        max_average_piece_bytes: usize::MAX,
+        min_fragmentation_ratio: 0.0,
+        forced_piece_count: usize::MAX,
+        forced_fragmentation_ratio: 1.0,
+    };
+
+    let mut session = DocumentSession::new();
+    session.open_file(path.clone()).unwrap();
+    match session.try_insert(TextPosition::new(0, 0), "[qem]") {
+        Ok(_) => {}
+        Err(DocumentError::Write { .. }) => {}
+        Err(err) => panic!("unexpected session insert error: {err}"),
+    }
+    let session_maintenance = session.maintenance_status_with_policy(policy);
+    assert_eq!(session_maintenance.backing(), DocumentBacking::PieceTable);
+    assert!(session_maintenance.has_piece_table());
+    assert!(session_maintenance.has_fragmentation_stats());
+    assert!(session_maintenance.is_compaction_recommended());
+    assert_eq!(
+        session_maintenance.compaction_urgency(),
+        Some(CompactionUrgency::Deferred)
+    );
+    assert_eq!(
+        session.maintenance_action_with_policy(policy),
+        MaintenanceAction::IdleCompaction
+    );
+    assert!(
+        session_maintenance
+            .fragmentation_stats()
+            .expect("session maintenance stats")
+            .piece_count()
+            > 1
+    );
+
+    let mut tab = EditorTab::new(77);
+    tab.open_file(path.clone()).unwrap();
+    match tab.try_insert(TextPosition::new(0, 0), "[qem]") {
+        Ok(_) => {}
+        Err(DocumentError::Write { .. }) => {}
+        Err(err) => panic!("unexpected tab insert error: {err}"),
+    }
+    let tab_maintenance = tab.maintenance_status_with_policy(policy);
+    assert_eq!(tab_maintenance.backing(), DocumentBacking::PieceTable);
+    assert!(tab_maintenance.has_piece_table());
+    assert!(tab_maintenance.has_fragmentation_stats());
+    assert!(tab_maintenance.is_compaction_recommended());
+    assert_eq!(
+        tab_maintenance.compaction_urgency(),
+        Some(CompactionUrgency::Deferred)
+    );
+    assert_eq!(
+        tab.maintenance_action_with_policy(policy),
+        MaintenanceAction::IdleCompaction
+    );
+    assert!(
+        tab_maintenance
+            .fragmentation_stats()
+            .expect("tab maintenance stats")
+            .piece_count()
+            > 1
+    );
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_and_tab_idle_compaction_wrappers_respect_deferred_and_forced_modes() {
+    let dir =
+        std::env::temp_dir().join(format!("qem-editor-idle-compaction-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("large-piece-table.txt");
+    let line = b"0000target\n";
+    let repeat = (1024 * 1024 / line.len()) + 64;
+    fs::write(&path, line.repeat(repeat)).unwrap();
+
+    let deferred_policy = CompactionPolicy {
+        min_total_bytes: 0,
+        min_piece_count: 2,
+        small_piece_threshold_bytes: usize::MAX,
+        max_average_piece_bytes: usize::MAX,
+        min_fragmentation_ratio: 0.0,
+        forced_piece_count: usize::MAX,
+        forced_fragmentation_ratio: 1.0,
+    };
+    let forced_policy = CompactionPolicy {
+        min_total_bytes: 0,
+        min_piece_count: 2,
+        small_piece_threshold_bytes: usize::MAX,
+        max_average_piece_bytes: usize::MAX,
+        min_fragmentation_ratio: 0.0,
+        forced_piece_count: 2,
+        forced_fragmentation_ratio: 0.0,
+    };
+
+    let mut session = DocumentSession::new();
+    session.open_file(path.clone()).unwrap();
+    match session.try_insert(TextPosition::new(0, 0), "[qem]") {
+        Ok(_) => {}
+        Err(DocumentError::Write { .. }) => {}
+        Err(err) => panic!("unexpected session insert error: {err}"),
+    }
+    match session.run_idle_compaction_with_policy(deferred_policy) {
+        Ok(IdleCompactionOutcome::Compacted(recommendation)) => {
+            assert_eq!(recommendation.urgency(), CompactionUrgency::Deferred);
+        }
+        Err(DocumentError::Write { .. }) => {}
+        other => panic!("unexpected session idle compaction result: {other:?}"),
+    }
+    assert_eq!(
+        session
+            .fragmentation_stats()
+            .expect("session stats after idle compaction")
+            .piece_count(),
+        1
+    );
+
+    let mut tab = EditorTab::new(707);
+    tab.open_file(path.clone()).unwrap();
+    match tab.try_insert(TextPosition::new(0, 0), "[qem]") {
+        Ok(_) => {}
+        Err(DocumentError::Write { .. }) => {}
+        Err(err) => panic!("unexpected tab insert error: {err}"),
+    }
+    match tab.run_idle_compaction_with_policy(forced_policy) {
+        Ok(IdleCompactionOutcome::ForcedPending(recommendation)) => {
+            assert_eq!(recommendation.urgency(), CompactionUrgency::Forced);
+        }
+        Err(DocumentError::Write { .. }) => {}
+        other => panic!("unexpected tab idle compaction result: {other:?}"),
+    }
+    assert_eq!(
+        tab.maintenance_action_with_policy(forced_policy),
+        MaintenanceAction::ExplicitCompaction
+    );
+    assert!(
+        tab.fragmentation_stats()
+            .expect("tab stats after forced pending")
+            .piece_count()
+            > 1
+    );
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
