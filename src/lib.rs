@@ -6,6 +6,8 @@
 //! and mutable rope or piece-table edit buffers so large-file workflows remain
 //! responsive without requiring full materialization up front.
 //!
+//! `Qem` is the project name, not an expanded acronym.
+//!
 //! # Picking the Right Layer
 //!
 //! - Use [`Document`] when your application already owns tab state, session

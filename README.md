@@ -12,6 +12,8 @@ Applications are expected to own their cursor, scrollbar, selection, and
 rendering model while Qem owns the hard part: huge-file access, viewport reads,
 text mutation, save pipelines, and persistent edit sessions.
 
+`Qem` is the project name, not an expanded acronym.
+
 Small files take a fast inline path: Qem fully indexes them during `open()` so
 line counts, viewport reads, and first edits are exact immediately without
 paying background-thread overhead.
@@ -43,14 +45,14 @@ next `Document::open`, as long as the source file identity still matches.
 
 ```toml
 [dependencies]
-qem = "0.5"
+qem = "0.5.3"
 ```
 
 To disable the editor/session wrapper and use only the document/storage layer:
 
 ```toml
 [dependencies]
-qem = { version = "0.5", default-features = false }
+qem = { version = "0.5.3", default-features = false }
 ```
 
 ## Cargo features
@@ -67,7 +69,7 @@ Example:
 
 ```toml
 [dependencies]
-qem = { version = "0.5", default-features = false, features = ["editor", "tmp-exe-dir"] }
+qem = { version = "0.5.3", default-features = false, features = ["editor", "tmp-exe-dir"] }
 ```
 
 Runtime override is also available:

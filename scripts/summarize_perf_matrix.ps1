@@ -61,7 +61,7 @@ if ($rows.Count -eq 0) {
 }
 
 $groups = $rows | Group-Object {
-    "{0}|{1}|{2}|{3}" -f $_.matrix_input_label, $_.matrix_state, $_.backing, $_.matrix_label
+    "{0}|{1}|{2}|{3}|{4}" -f $_.matrix_input_label, $_.matrix_state, $_.backing, $_.matrix_label, $_.matrix_viewport_anchor
 }
 
 $lines = New-Object System.Collections.Generic.List[string]
@@ -69,18 +69,25 @@ $lines.Add("# Perf Matrix Summary")
 $lines.Add("")
 $lines.Add(('Source: `{0}`' -f $InputJsonl))
 $lines.Add("")
-$lines.Add('| input | label | state | backing | runs | open ms | viewport ms | next ms | prev ms | find_all ms |')
-$lines.Add('| --- | --- | --- | --- | ---: | --- | --- | --- | --- | --- |')
+$lines.Add('| input | size GiB | label | anchor | state | backing | runs | open ms | viewport ms | next ms | prev ms | find_all ms |')
+$lines.Add('| --- | ---: | --- | --- | --- | --- | ---: | --- | --- | --- | --- | --- |')
 
 foreach ($group in ($groups | Sort-Object Name)) {
-    $parts = $group.Name.Split('|', 4)
+    $parts = $group.Name.Split('|', 5)
     $inputLabel = $parts[0]
     $state = $parts[1]
     $backing = $parts[2]
     $matrixLabel = $parts[3]
+    $viewportAnchor = $parts[4]
     if ([string]::IsNullOrWhiteSpace($matrixLabel)) {
         $matrixLabel = "-"
     }
+    if ([string]::IsNullOrWhiteSpace($viewportAnchor)) {
+        $viewportAnchor = "middle"
+    }
+
+    $firstRow = $group.Group | Select-Object -First 1
+    $sizeGiB = Format-InvariantNumber (([double]$firstRow.file_len_bytes) / 1GB)
 
     $openStats = Get-StatsRow ($group.Group | ForEach-Object { $_.open_ms })
     $viewportStats = Get-StatsRow ($group.Group | ForEach-Object { $_.viewport_ms })
@@ -89,9 +96,11 @@ foreach ($group in ($groups | Sort-Object Name)) {
     $findAllStats = Get-StatsRow ($group.Group | ForEach-Object { $_.find_all_ms })
 
     $lines.Add(
-        ('| {0} | {1} | {2} | {3} | {4} | {5} [{6}-{7}] | {8} [{9}-{10}] | {11} [{12}-{13}] | {14} [{15}-{16}] | {17} [{18}-{19}] |' -f
+        ('| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} [{8}-{9}] | {10} [{11}-{12}] | {13} [{14}-{15}] | {16} [{17}-{18}] | {19} [{20}-{21}] |' -f
             $inputLabel,
+            $sizeGiB,
             $matrixLabel,
+            $viewportAnchor,
             $state,
             $backing,
             $group.Count,

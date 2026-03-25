@@ -4,6 +4,40 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy)]
+enum ViewportAnchor {
+    Head,
+    Middle,
+    Tail,
+}
+
+impl ViewportAnchor {
+    fn parse(value: &str) -> Result<Self, &'static str> {
+        match value {
+            "head" => Ok(Self::Head),
+            "middle" => Ok(Self::Middle),
+            "tail" => Ok(Self::Tail),
+            _ => Err("--viewport-anchor must be one of: head, middle, tail"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Head => "head",
+            Self::Middle => "middle",
+            Self::Tail => "tail",
+        }
+    }
+
+    fn resolve_line(self, display_line_count: usize) -> usize {
+        match self {
+            Self::Head => 0,
+            Self::Middle => display_line_count.saturating_sub(1) / 2,
+            Self::Tail => display_line_count.saturating_sub(1),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PerfProbeOptions {
     input: PathBuf,
@@ -13,19 +47,26 @@ struct PerfProbeOptions {
     seed_edit: Option<String>,
     save: Option<PathBuf>,
     wait_timeout: Duration,
+    viewport_anchor: ViewportAnchor,
     json: bool,
 }
 
 #[derive(Debug)]
 struct PerfProbeReport {
     input: PathBuf,
+    file_len_bytes: usize,
     backing: String,
+    display_line_count: usize,
+    line_count_exact: bool,
+    exact_line_count: Option<usize>,
+    indexed_bytes: usize,
     open_ms: f64,
     index_wait_ms: f64,
     indexing_complete: bool,
     seed_edit_ms: Option<f64>,
     seed_edit_cursor: Option<TextPosition>,
     viewport_ms: f64,
+    viewport_anchor: String,
     viewport_line: usize,
     viewport_rows: usize,
     piece_count: Option<usize>,
@@ -69,7 +110,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         seed_edit_cursor = Some(cursor);
     }
 
-    let viewport_line = doc.display_line_count().saturating_sub(1) / 2;
+    let file_len_bytes = doc.file_len();
+    let display_line_count = doc.display_line_count();
+    let line_count_exact = doc.is_line_count_exact();
+    let exact_line_count = doc.exact_line_count();
+    let indexed_bytes = doc.indexed_bytes();
+    let viewport_line = options.viewport_anchor.resolve_line(display_line_count);
     let viewport_request = ViewportRequest::new(viewport_line, 120).with_columns(0, 160);
     let viewport_started = Instant::now();
     let viewport = doc.read_viewport(viewport_request);
@@ -142,13 +188,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let report = PerfProbeReport {
         input: options.input,
+        file_len_bytes,
         backing: doc.backing().as_str().to_owned(),
+        display_line_count,
+        line_count_exact,
+        exact_line_count,
+        indexed_bytes,
         open_ms,
         index_wait_ms,
         indexing_complete,
         seed_edit_ms,
         seed_edit_cursor,
         viewport_ms,
+        viewport_anchor: options.viewport_anchor.as_str().to_owned(),
         viewport_line,
         viewport_rows: viewport.rows().len(),
         piece_count,
@@ -180,7 +232,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn parse_args() -> Result<PerfProbeOptions, Box<dyn std::error::Error>> {
     let mut args = env::args_os().skip(1);
     let input = args.next().map(PathBuf::from).ok_or(
-        "usage: cargo run --example perf_probe -- <input> [--needle text] [--find-all-limit n] [--find-all-range-lines n] [--seed-edit text] [--save output] [--wait-secs n] [--json]",
+        "usage: cargo run --example perf_probe -- <input> [--needle text] [--find-all-limit n] [--find-all-range-lines n] [--seed-edit text] [--save output] [--wait-secs n] [--viewport-anchor head|middle|tail] [--json]",
     )?;
 
     let mut needle = None;
@@ -189,6 +241,7 @@ fn parse_args() -> Result<PerfProbeOptions, Box<dyn std::error::Error>> {
     let mut seed_edit = None;
     let mut save = None;
     let mut wait_timeout = Duration::from_secs(20);
+    let mut viewport_anchor = ViewportAnchor::Middle;
     let mut json = false;
 
     while let Some(arg) = args.next() {
@@ -231,6 +284,10 @@ fn parse_args() -> Result<PerfProbeOptions, Box<dyn std::error::Error>> {
                     .map_err(|_| "--wait-secs must be an integer")?;
                 wait_timeout = Duration::from_secs(secs);
             }
+            "--viewport-anchor" => {
+                let value = args.next().ok_or("--viewport-anchor requires a value")?;
+                viewport_anchor = ViewportAnchor::parse(value.to_string_lossy().as_ref())?;
+            }
             "--json" => {
                 json = true;
             }
@@ -252,6 +309,7 @@ fn parse_args() -> Result<PerfProbeOptions, Box<dyn std::error::Error>> {
         seed_edit,
         save,
         wait_timeout,
+        viewport_anchor,
         json,
     })
 }
@@ -261,6 +319,17 @@ fn millis(duration: Duration) -> f64 {
 }
 
 fn print_human_report(report: &PerfProbeReport) {
+    println!(
+        "file_len_bytes={}, indexed_bytes={}, display_line_count={}, line_count_exact={}, exact_line_count={}",
+        report.file_len_bytes,
+        report.indexed_bytes,
+        report.display_line_count,
+        report.line_count_exact,
+        report
+            .exact_line_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "estimated".to_owned())
+    );
     println!("open_ms={:.3}", report.open_ms);
     println!(
         "index_wait_ms={:.3}, indexing_complete={}",
@@ -273,8 +342,8 @@ fn print_human_report(report: &PerfProbeReport) {
         );
     }
     println!(
-        "viewport_ms={:.3}, viewport_line={}, rows={}",
-        report.viewport_ms, report.viewport_line, report.viewport_rows
+        "viewport_anchor={}, viewport_ms={:.3}, viewport_line={}, rows={}",
+        report.viewport_anchor, report.viewport_ms, report.viewport_line, report.viewport_rows
     );
     if let Some(piece_count) = report.piece_count {
         println!(
@@ -324,14 +393,20 @@ fn print_human_report(report: &PerfProbeReport) {
 
 fn print_json_report(report: &PerfProbeReport) {
     println!(
-        "{{\"input\":\"{}\",\"backing\":\"{}\",\"open_ms\":{:.3},\"index_wait_ms\":{:.3},\"indexing_complete\":{},\"seed_edit_ms\":{},\"seed_edit_cursor\":{},\"viewport_ms\":{:.3},\"viewport_line\":{},\"viewport_rows\":{},\"piece_count\":{},\"average_piece_bytes\":{},\"fragmentation_ratio\":{},\"compaction_urgency\":{},\"maintenance_action\":\"{}\",\"next_ms\":{},\"next_match\":{},\"prev_ms\":{},\"prev_match\":{},\"find_all_ms\":{},\"find_all_count\":{},\"find_all_limit\":{},\"find_all_range_lines\":{},\"save_ms\":{},\"save_output\":{}}}",
+        "{{\"input\":\"{}\",\"file_len_bytes\":{},\"backing\":\"{}\",\"display_line_count\":{},\"line_count_exact\":{},\"exact_line_count\":{},\"indexed_bytes\":{},\"open_ms\":{:.3},\"index_wait_ms\":{:.3},\"indexing_complete\":{},\"seed_edit_ms\":{},\"seed_edit_cursor\":{},\"viewport_anchor\":\"{}\",\"viewport_ms\":{:.3},\"viewport_line\":{},\"viewport_rows\":{},\"piece_count\":{},\"average_piece_bytes\":{},\"fragmentation_ratio\":{},\"compaction_urgency\":{},\"maintenance_action\":\"{}\",\"next_ms\":{},\"next_match\":{},\"prev_ms\":{},\"prev_match\":{},\"find_all_ms\":{},\"find_all_count\":{},\"find_all_limit\":{},\"find_all_range_lines\":{},\"save_ms\":{},\"save_output\":{}}}",
         json_escape(&report.input.display().to_string()),
+        report.file_len_bytes,
         json_escape(&report.backing),
+        report.display_line_count,
+        report.line_count_exact,
+        option_usize_json(report.exact_line_count),
+        report.indexed_bytes,
         report.open_ms,
         report.index_wait_ms,
         report.indexing_complete,
         option_f64_json(report.seed_edit_ms),
         option_position_json(report.seed_edit_cursor),
+        json_escape(&report.viewport_anchor),
         report.viewport_ms,
         report.viewport_line,
         report.viewport_rows,

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.3
+
+### Added
+
+- Added a more public huge-file benchmark workflow around `examples/perf_probe.rs`, including head/middle/tail viewport anchors and giant-file metadata such as `file_len_bytes`, `indexed_bytes`, and exact-vs-estimated line-count reporting.
+- Added helper scripts for collecting and summarizing repeatable JSONL probe matrices and for generating a sparse `1TB` structural stress fixture.
+- Added benchmark documentation for public `1TB` methodology and explicit caveats around current giant-file editing and search limits.
+
+### Changed
+
+- README installation examples now point at the current `0.5.3` release instead of the broader `0.5` range so the crates.io page matches the latest published patch.
+
+### Fixed
+
+- Clarified in the public docs that `Qem` is the project name rather than an expanded acronym, reducing accidental third-party mislabeling.
+
 ## 0.5.2
 
 ### Added

@@ -111,7 +111,7 @@ cargo run --example perf_probe -- .\huge.log --needle 00 --find-all-limit 512 --
 For machine-readable output:
 
 ```powershell
-cargo run --example perf_probe -- .\huge.log --needle ERROR --json
+cargo run --example perf_probe -- .\huge.log --needle ERROR --viewport-anchor middle --json
 ```
 
 Use `perf_probe` when you want a manual matrix for `1GB / 10GB / 50GB` files:
@@ -119,6 +119,7 @@ Use `perf_probe` when you want a manual matrix for `1GB / 10GB / 50GB` files:
 - run once after a reboot or cache flush for a cold-ish data point
 - run again immediately for a warm-cache data point
 - repeat with and without `--seed-edit` to separate clean mmap from edited paths
+- repeat with `--viewport-anchor head`, `middle`, and `tail` when the frontend story matters
 - keep the exact command line and machine/storage notes next to the numbers
 
 If you want a repeatable JSONL export instead of running those commands by
@@ -130,6 +131,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\collect_perf_matrix.ps1 `
   -Needle ERROR `
   -FindAllLimit 128 `
   -FindAllRangeLines 2048 `
+  -ViewportAnchors head,middle,tail `
   -Repeats 3 `
   -MatrixLabel warm `
   -OutputJsonl .\target\perf-matrix.jsonl
@@ -148,6 +150,100 @@ powershell -ExecutionPolicy Bypass -File .\scripts\summarize_perf_matrix.ps1 `
   -InputJsonl .\target\perf-matrix.jsonl `
   -OutputMarkdown .\target\perf-matrix-summary.md
 ```
+
+## 1TB Public Matrix
+
+For a public `1TB` benchmark, prefer a real `1TB` text file when you want to
+publish throughput claims. Qem's existing probe/matrix flow can already drive
+that run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\collect_perf_matrix.ps1 `
+  .\real-1tb.log `
+  -Needle ERROR `
+  -FindAllLimit 128 `
+  -FindAllRangeLines 2048 `
+  -ViewportAnchors head,middle,tail `
+  -Repeats 3 `
+  -WaitSecs 120 `
+  -MatrixLabel 1tb-warm `
+  -OutputJsonl .\target\perf-1tb.jsonl
+```
+
+Then summarize it:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\summarize_perf_matrix.ps1 `
+  -InputJsonl .\target\perf-1tb.jsonl `
+  -OutputMarkdown .\target\perf-1tb-summary.md
+```
+
+`perf_probe` now emits metadata that matters for giant-file claims:
+
+- `file_len_bytes`
+- `indexed_bytes`
+- `display_line_count`
+- `line_count_exact`
+- `exact_line_count`
+- `viewport_anchor`
+
+That makes it easier to publish honest numbers such as "open was fast, but the
+full line index was still building" instead of implying more than the engine
+actually finished.
+
+## Sparse 1TB Stress Fixture
+
+If you want a fast, reproducible structural stress file without allocating
+`1TB` of physical storage, generate a sparse fixture:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\create_sparse_stress_fixture.ps1 `
+  .\target\qem-sparse-1tb.log `
+  -LogicalSize 1TB `
+  -Force
+```
+
+Then probe it the same way:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\collect_perf_matrix.ps1 `
+  .\target\qem-sparse-1tb.log `
+  -ViewportAnchors head,middle,tail `
+  -Repeats 3 `
+  -WaitSecs 10 `
+  -MatrixLabel sparse-1tb `
+  -OutputJsonl .\target\perf-sparse-1tb.jsonl
+```
+
+This sparse fixture is useful for:
+
+- mmap/open envelope checks
+- head/middle/tail viewport access
+- file-size and indexing metadata sanity checks
+
+It is not a representative replacement for a real `1TB` text corpus when
+publishing throughput claims. Sparse holes read back as zero bytes, so search
+and text-structure behavior will not match a real log or source dump.
+
+## Current 1TB Caveats
+
+Qem is currently in a strong position for `clean file-backed` `1TB` workflows:
+
+- synchronous open on the mmap path
+- viewport reads without full materialization
+- background sidecar indexing
+- estimated line counts while indexing is still incomplete
+
+But a few caveats should be stated explicitly when sharing public numbers:
+
+- exact global line counts may take a long time because the `.qem.lineidx`
+  sidecar still has to scan the whole file
+- the in-memory newline offset budget is intentionally capped, so early opens may
+  rely on estimates before the disk index is ready
+- giant-file editing is still bounded by the existing safety limits and should
+  not be marketed as "edit arbitrary 1TB files freely"
+- literal search on far-offset matches is not yet the same maturity tier as the
+  viewport/open path for `1TB` workloads
 
 ## Publishing Guidance
 
