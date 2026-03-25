@@ -113,8 +113,11 @@ the selected temp policy.
 
 ## Current Support Matrix
 
-- UTF-8 / ASCII text is the primary stable path: open, viewport reads, edits, undo/redo, and saves are supported.
-- Non-UTF8 or invalid UTF-8 bytes can still be opened and inspected, but text-facing APIs expose lossy UTF-8 views. Encoding-preserving edit/save behavior for arbitrary legacy encodings is not yet a stable contract.
+- UTF-8 / ASCII text is the primary stable fast path: open, viewport reads, edits, undo/redo, and saves are supported without transcoding.
+- Explicit legacy-encoding open/save is available through `Document::open_with_encoding(...)`, `Document::save_to_with_encoding(...)`, and the matching `DocumentSession` / `EditorTab` wrappers. For BOM-backed UTF-16 files there is also a convenience `Document::open_with_auto_encoding_detection(...)` path. If you want a more extensible contract now, the same flows are also exposed through `DocumentOpenOptions`, `OpenEncodingPolicy`, and `DocumentSaveOptions`.
+- Auto-detect open currently recognizes BOM-backed UTF-16 files and otherwise keeps the normal UTF-8 / ASCII fast path. Legacy encodings without a BOM still require an explicit reinterpretation encoding.
+- Non-UTF8 opens currently materialize into a rope-backed document instead of using the mmap fast path. Very large legacy-encoded files may therefore still be rejected until the broader encoding contract lands in a later release.
+- Preserve-save for some decoded encodings can still return a typed encoding error until a broader persistence contract lands. Today you can explicitly convert on save through `DocumentSaveOptions::with_encoding(...)` or `Document::save_to_with_encoding(...)`.
 - Huge files are supported for mmap-backed reads, viewport rendering, line-count estimation, and background indexing without full materialization. Editing may be rejected when it would require unsafe rope promotion beyond the built-in size limits.
 - `.qem.lineidx` and `.qem.editlog` are internal cache/session sidecars. Qem invalidates them when file length, modification time, or sampled content fingerprint no longer match. Their on-disk formats are internal implementation details rather than stable interchange formats, so Qem may rebuild, discard, or version-bump them across releases.
 - Typed progress/state APIs such as `indexing_state()`, `loading_state()`, `loading_phase()`, `save_state()`, `background_issue()`, `take_background_issue()`, and `close_pending()` are the supported session-facing surface.
@@ -250,6 +253,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = doc.try_insert(TextPosition::new(0, 0), "[Qem]\n")?;
     let _ = doc.try_replace(TextRange::new(TextPosition::new(1, 0), 4), "HEAD")?;
     doc.save_to(path)?;
+
+    Ok(())
+}
+```
+
+## Encoding Example
+
+```rust
+use qem::{Document, DocumentEncoding, DocumentOpenOptions, DocumentSaveOptions};
+use std::path::Path;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let path = Path::new("legacy-cp1251.txt");
+    let target = Path::new("legacy-cp1251-copy.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+
+    let mut doc = Document::open_with_options(
+        path,
+        DocumentOpenOptions::new().with_reinterpretation(encoding),
+    )?;
+    if doc.decoding_had_errors() {
+        eprintln!("source contained malformed byte sequences for {}", doc.encoding());
+    }
+
+    let _ = doc.try_insert_text_at(0, 0, "header: ")?;
+    doc.save_to_with_options(
+        target,
+        DocumentSaveOptions::new().with_encoding(DocumentEncoding::utf8()),
+    )?;
 
     Ok(())
 }

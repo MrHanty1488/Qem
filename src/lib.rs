@@ -172,11 +172,26 @@
 //!
 //! # Current Contract
 //!
-//! - UTF-8 and ASCII text are the primary stable path: open, viewport reads,
-//!   edits, undo/redo, and saves are supported.
-//! - Non-UTF8 or invalid UTF-8 bytes can still be opened and inspected, but
-//!   text-facing APIs expose lossy UTF-8 views. Encoding-preserving edit/save
-//!   behavior for arbitrary legacy encodings is not yet a stable contract.
+//! - UTF-8 and ASCII text are the primary stable fast path: open, viewport
+//!   reads, edits, undo/redo, and saves are supported without transcoding.
+//! - Explicit encoding open/save is available through
+//!   [`Document::open_with_encoding`] and [`Document::save_to_with_encoding`]
+//!   plus the session/tab wrappers. For convenience, BOM-backed UTF-16 files
+//!   can also use [`Document::open_with_auto_encoding_detection`]. For a more
+//!   extensible contract, the same flows are also exposed through
+//!   [`DocumentOpenOptions`], [`OpenEncodingPolicy`], and
+//!   [`DocumentSaveOptions`].
+//! - Auto-detect open currently recognizes BOM-backed UTF-16 files and
+//!   otherwise keeps the normal UTF-8/ASCII fast path. Legacy encodings without
+//!   a BOM still require an explicit reinterpretation encoding.
+//! - Non-UTF8 opens currently materialize into a rope-backed document instead
+//!   of using the mmap fast path. Very large legacy-encoded files may therefore
+//!   still be rejected until the broader encoding contract lands in a later
+//!   release.
+//! - Preserve-save for some decoded encodings can still return a typed
+//!   [`DocumentError::Encoding`] until a broader persistence contract lands.
+//!   Callers can already convert to a supported target through
+//!   [`DocumentSaveOptions`] or [`Document::save_to_with_encoding`].
 //! - Huge files are supported for mmap-backed reads, viewport rendering, line
 //!   counting, and background indexing without full materialization. Editing
 //!   may be rejected when it would require rope materialization beyond the
@@ -214,10 +229,11 @@ pub mod storage;
 
 pub use document::{
     ByteProgress, CompactionPolicy, CompactionRecommendation, CompactionUrgency, CutResult,
-    Document, DocumentBacking, DocumentError, DocumentMaintenanceStatus, DocumentStatus,
-    EditCapability, EditResult, FragmentationStats, IdleCompactionOutcome, LineCount, LineEnding,
-    LineSlice, LiteralSearchIter, LiteralSearchQuery, MaintenanceAction, SearchMatch, TextPosition,
-    TextRange, TextSelection, TextSlice, Viewport, ViewportRequest, ViewportRow,
+    Document, DocumentBacking, DocumentEncoding, DocumentError, DocumentMaintenanceStatus,
+    DocumentOpenOptions, DocumentSaveOptions, DocumentStatus, EditCapability, EditResult,
+    FragmentationStats, IdleCompactionOutcome, LineCount, LineEnding, LineSlice, LiteralSearchIter,
+    LiteralSearchQuery, MaintenanceAction, OpenEncodingPolicy, SaveEncodingPolicy, SearchMatch,
+    TextPosition, TextRange, TextSelection, TextSlice, Viewport, ViewportRequest, ViewportRow,
 };
 #[cfg(feature = "editor")]
 pub use editor::{

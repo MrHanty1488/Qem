@@ -32,10 +32,11 @@ pub(crate) use lifecycle::OpenProgressPhase;
 pub(crate) use persistence::{PreparedSave, SaveCompletion};
 pub use search::{LiteralSearchIter, LiteralSearchQuery};
 pub use types::{
-    ByteProgress, CutResult, DocumentBacking, DocumentError, DocumentMaintenanceStatus,
-    DocumentStatus, EditCapability, EditResult, LineCount, LineSlice, MaintenanceAction,
-    SearchMatch, TextPosition, TextRange, TextSelection, TextSlice, Viewport, ViewportRequest,
-    ViewportRow,
+    ByteProgress, CutResult, DocumentBacking, DocumentEncoding, DocumentError,
+    DocumentMaintenanceStatus, DocumentOpenOptions, DocumentSaveOptions, DocumentStatus,
+    EditCapability, EditResult, LineCount, LineSlice, MaintenanceAction, OpenEncodingPolicy,
+    SaveEncodingPolicy, SearchMatch, TextPosition, TextRange, TextSelection, TextSlice, Viewport,
+    ViewportRequest, ViewportRow,
 };
 
 // Hard limits to keep mmap indexing bounded for huge files.
@@ -87,6 +88,21 @@ impl LineEnding {
 }
 
 fn detect_line_ending(bytes: &[u8]) -> LineEnding {
+    let Some(pos) = memchr2(b'\n', b'\r', bytes) else {
+        return LineEnding::Lf;
+    };
+
+    match bytes[pos] {
+        b'\n' if pos > 0 && bytes[pos - 1] == b'\r' => LineEnding::Crlf,
+        b'\n' => LineEnding::Lf,
+        b'\r' if pos + 1 < bytes.len() && bytes[pos + 1] == b'\n' => LineEnding::Crlf,
+        b'\r' => LineEnding::Cr,
+        _ => LineEnding::Lf,
+    }
+}
+
+fn detect_line_ending_text(text: &str) -> LineEnding {
+    let bytes = text.as_bytes();
     let Some(pos) = memchr2(b'\n', b'\r', bytes) else {
         return LineEnding::Lf;
     };
@@ -192,6 +208,83 @@ fn build_rope_from_bytes(bytes: &[u8]) -> Rope {
     }
 
     builder.finish()
+}
+
+fn normalize_decoded_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    let _ = chars.next();
+                }
+                normalized.push('\n');
+            }
+            _ => normalized.push(ch),
+        }
+    }
+    normalized
+}
+
+fn build_rope_from_decoded_text(text: &str) -> Rope {
+    if text.is_empty() {
+        return Rope::new();
+    }
+
+    let normalized = normalize_decoded_text(text);
+    let mut builder = RopeBuilder::new();
+    builder.append(&normalized);
+    builder.finish()
+}
+
+fn rope_text_with_line_endings(rope: &Rope, line_ending: LineEnding) -> String {
+    if line_ending == LineEnding::Lf {
+        return rope.to_string();
+    }
+
+    let newline = line_ending.as_str();
+    let extra_per_break = newline.len().saturating_sub(1);
+    let mut rendered = String::with_capacity(
+        rope.len_bytes().saturating_add(
+            rope.len_lines()
+                .saturating_sub(1)
+                .saturating_mul(extra_per_break),
+        ),
+    );
+    for chunk in rope.chunks() {
+        for ch in chunk.chars() {
+            if ch == '\n' {
+                rendered.push_str(newline);
+            } else {
+                rendered.push(ch);
+            }
+        }
+    }
+    rendered
+}
+
+fn decode_text_with_encoding(bytes: &[u8], encoding: DocumentEncoding) -> (String, bool) {
+    let (decoded, had_errors) = encoding.as_encoding().decode_with_bom_removal(bytes);
+    (decoded.into_owned(), had_errors)
+}
+
+fn encode_text_with_encoding(
+    text: &str,
+    encoding: DocumentEncoding,
+) -> Result<Vec<u8>, &'static str> {
+    if !encoding.can_roundtrip_save() {
+        return Err("this encoding is not yet supported as a save target");
+    }
+
+    let (encoded, output_encoding, had_errors) = encoding.as_encoding().encode(text);
+    if output_encoding != encoding.as_encoding() {
+        return Err("encoding_rs redirected this save target to a different encoding");
+    }
+    if had_errors {
+        return Err("the current document contains characters that are not representable in the target encoding");
+    }
+    Ok(encoded.into_owned())
 }
 
 fn rope_save_len_bytes(rope: &Rope, line_ending: LineEnding) -> usize {
@@ -823,6 +916,8 @@ pub struct Document {
     indexed_bytes: Arc<AtomicUsize>,
     avg_line_len: Arc<AtomicUsize>,
     line_ending: LineEnding,
+    encoding: DocumentEncoding,
+    decoding_had_errors: bool,
 
     // Mutable text storage. When present, it becomes the source of truth for rendering/editing.
     rope: Option<Rope>,

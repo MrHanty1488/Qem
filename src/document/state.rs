@@ -319,6 +319,8 @@ impl Document {
             self.file_len(),
             self.line_count(),
             self.line_ending(),
+            self.encoding(),
+            self.decoding_had_errors(),
             self.indexing_state(),
             self.backing(),
         )
@@ -362,7 +364,13 @@ impl Document {
             return piece_table.total_len();
         }
         if let Some(rope) = &self.rope {
-            return rope_save_len_bytes(rope, self.line_ending);
+            if self.encoding.is_utf8() {
+                return rope_save_len_bytes(rope, self.line_ending);
+            }
+            let rendered = rope_text_with_line_endings(rope, self.line_ending);
+            return encode_text_with_encoding(&rendered, self.encoding)
+                .map(|bytes| bytes.len())
+                .unwrap_or_else(|_| rendered.len());
         }
         self.file_len
     }
@@ -370,6 +378,16 @@ impl Document {
     /// Returns the currently detected line ending style for the document.
     pub fn line_ending(&self) -> LineEnding {
         self.line_ending
+    }
+
+    /// Returns the current explicit or inherited encoding contract for the document.
+    pub fn encoding(&self) -> DocumentEncoding {
+        self.encoding
+    }
+
+    /// Returns `true` when opening the source required replacement characters.
+    pub fn decoding_had_errors(&self) -> bool {
+        self.decoding_had_errors
     }
 
     /// Returns the full document text, applying lossy UTF-8 decoding when needed.

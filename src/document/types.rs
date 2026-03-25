@@ -1,8 +1,199 @@
 use super::{CompactionRecommendation, CompactionUrgency, FragmentationStats, LineEnding};
+use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8};
 use std::fmt;
 use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+
+/// Named text encoding used for explicit open/save operations.
+#[derive(Clone, Copy)]
+pub struct DocumentEncoding(&'static Encoding);
+
+impl DocumentEncoding {
+    /// Returns the stable UTF-8 encoding used by Qem's default fast path.
+    pub const fn utf8() -> Self {
+        Self(UTF_8)
+    }
+
+    /// Returns UTF-16LE for BOM-backed reinterpret/open flows.
+    pub const fn utf16le() -> Self {
+        Self(UTF_16LE)
+    }
+
+    /// Returns UTF-16BE for BOM-backed reinterpret/open flows.
+    pub const fn utf16be() -> Self {
+        Self(UTF_16BE)
+    }
+
+    /// Looks up an encoding by label accepted by `encoding_rs`.
+    pub fn from_label(label: &str) -> Option<Self> {
+        Encoding::for_label(label.as_bytes()).map(Self)
+    }
+
+    /// Returns the canonical label for this encoding.
+    pub fn name(self) -> &'static str {
+        self.0.name()
+    }
+
+    /// Returns `true` when this is UTF-8.
+    pub fn is_utf8(self) -> bool {
+        self.0 == UTF_8
+    }
+
+    /// Returns `true` when `encoding_rs` can round-trip saves using this encoding.
+    pub fn can_roundtrip_save(self) -> bool {
+        self.0.output_encoding() == self.0
+    }
+
+    pub(crate) const fn as_encoding(self) -> &'static Encoding {
+        self.0
+    }
+}
+
+impl Default for DocumentEncoding {
+    fn default() -> Self {
+        Self::utf8()
+    }
+}
+
+impl PartialEq for DocumentEncoding {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
+
+impl Eq for DocumentEncoding {}
+
+impl std::hash::Hash for DocumentEncoding {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name().hash(state);
+    }
+}
+
+impl fmt::Debug for DocumentEncoding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("DocumentEncoding")
+            .field(&self.name())
+            .finish()
+    }
+}
+
+impl fmt::Display for DocumentEncoding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Open policy for choosing between the UTF-8 mmap fast path, initial
+/// BOM-backed detection, or an explicit reinterpretation encoding.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum OpenEncodingPolicy {
+    /// Keep the existing UTF-8/ASCII mmap fast path and its current semantics.
+    #[default]
+    Utf8FastPath,
+    /// Detect BOM-backed encodings on open and otherwise fall back to the
+    /// normal UTF-8/ASCII fast path.
+    ///
+    /// This first detection slice intentionally avoids heavyweight legacy
+    /// charset guessing so open-time cost stays predictable.
+    AutoDetect,
+    /// Reinterpret the source bytes through the requested encoding.
+    ///
+    /// This is the option to use for legacy encodings such as
+    /// `windows-1251`, `Shift_JIS`, or `GB18030` when the caller already knows
+    /// the intended source encoding.
+    Reinterpret(DocumentEncoding),
+}
+
+/// Explicit document-open options for choosing between the default UTF-8 path
+/// and encoding-aware reinterpretation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct DocumentOpenOptions {
+    encoding_policy: OpenEncodingPolicy,
+}
+
+impl DocumentOpenOptions {
+    /// Creates open options that use Qem's default UTF-8 fast path.
+    pub const fn new() -> Self {
+        Self {
+            encoding_policy: OpenEncodingPolicy::Utf8FastPath,
+        }
+    }
+
+    /// Returns options that enable the initial BOM-backed auto-detect path.
+    pub const fn with_auto_encoding_detection(mut self) -> Self {
+        self.encoding_policy = OpenEncodingPolicy::AutoDetect;
+        self
+    }
+
+    /// Returns options that reinterpret the source through the given encoding.
+    pub const fn with_reinterpretation(mut self, encoding: DocumentEncoding) -> Self {
+        self.encoding_policy = OpenEncodingPolicy::Reinterpret(encoding);
+        self
+    }
+
+    /// Returns options that force decoding the source through the given encoding.
+    ///
+    /// This is an alias for [`Self::with_reinterpretation`] kept for ergonomic
+    /// compatibility with the first encoding-support release.
+    pub const fn with_encoding(mut self, encoding: DocumentEncoding) -> Self {
+        self.encoding_policy = OpenEncodingPolicy::Reinterpret(encoding);
+        self
+    }
+
+    /// Returns the current open encoding policy.
+    pub const fn encoding_policy(self) -> OpenEncodingPolicy {
+        self.encoding_policy
+    }
+
+    /// Returns the explicit reinterpretation encoding, if one was requested.
+    ///
+    /// This compatibility helper returns `None` for the default fast path and
+    /// for auto-detect mode.
+    pub const fn encoding_override(self) -> Option<DocumentEncoding> {
+        match self.encoding_policy {
+            OpenEncodingPolicy::Reinterpret(encoding) => Some(encoding),
+            OpenEncodingPolicy::Utf8FastPath | OpenEncodingPolicy::AutoDetect => None,
+        }
+    }
+}
+
+/// Save policy for preserving the current document encoding or converting to a
+/// different target encoding on write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum SaveEncodingPolicy {
+    /// Save using the document's current encoding contract.
+    #[default]
+    Preserve,
+    /// Convert the current document text into the requested target encoding.
+    Convert(DocumentEncoding),
+}
+
+/// Explicit document-save options.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct DocumentSaveOptions {
+    encoding_policy: SaveEncodingPolicy,
+}
+
+impl DocumentSaveOptions {
+    /// Creates save options that preserve the current document encoding.
+    pub const fn new() -> Self {
+        Self {
+            encoding_policy: SaveEncodingPolicy::Preserve,
+        }
+    }
+
+    /// Returns options that convert the current document text to `encoding` on save.
+    pub const fn with_encoding(mut self, encoding: DocumentEncoding) -> Self {
+        self.encoding_policy = SaveEncodingPolicy::Convert(encoding);
+        self
+    }
+
+    /// Returns the encoding policy that will be used when saving.
+    pub const fn encoding_policy(self) -> SaveEncodingPolicy {
+        self.encoding_policy
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineSlice {
@@ -651,18 +842,23 @@ pub struct DocumentStatus {
     file_len: usize,
     line_count: LineCount,
     line_ending: LineEnding,
+    encoding: DocumentEncoding,
+    decoding_had_errors: bool,
     indexing: Option<ByteProgress>,
     backing: DocumentBacking,
 }
 
 impl DocumentStatus {
     /// Creates a document status snapshot.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         path: Option<PathBuf>,
         dirty: bool,
         file_len: usize,
         line_count: LineCount,
         line_ending: LineEnding,
+        encoding: DocumentEncoding,
+        decoding_had_errors: bool,
         indexing: Option<ByteProgress>,
         backing: DocumentBacking,
     ) -> Self {
@@ -672,6 +868,8 @@ impl DocumentStatus {
             file_len,
             line_count,
             line_ending,
+            encoding,
+            decoding_had_errors,
             indexing,
             backing,
         }
@@ -715,6 +913,16 @@ impl DocumentStatus {
     /// Returns the currently detected line ending style.
     pub fn line_ending(&self) -> LineEnding {
         self.line_ending
+    }
+
+    /// Returns the current document encoding contract.
+    pub fn encoding(&self) -> DocumentEncoding {
+        self.encoding
+    }
+
+    /// Returns `true` when opening the source required lossy decode replacement.
+    pub fn decoding_had_errors(&self) -> bool {
+        self.decoding_had_errors
     }
 
     /// Returns typed indexing progress while background indexing is active.
@@ -859,6 +1067,13 @@ pub enum DocumentError {
     Map { path: PathBuf, source: io::Error },
     /// A write, rename, or reload step failed.
     Write { path: PathBuf, source: io::Error },
+    /// Encoding negotiation, decode, or save conversion failed.
+    Encoding {
+        path: PathBuf,
+        operation: &'static str,
+        encoding: DocumentEncoding,
+        message: String,
+    },
     /// The requested edit operation is unsupported for the current document state.
     EditUnsupported {
         path: Option<PathBuf>,
@@ -872,6 +1087,16 @@ impl std::fmt::Display for DocumentError {
             Self::Open { path, source } => write!(f, "open `{}`: {source}", path.display()),
             Self::Map { path, source } => write!(f, "mmap `{}`: {source}", path.display()),
             Self::Write { path, source } => write!(f, "write `{}`: {source}", path.display()),
+            Self::Encoding {
+                path,
+                operation,
+                encoding,
+                message,
+            } => write!(
+                f,
+                "{operation} `{}` with encoding `{encoding}`: {message}",
+                path.display()
+            ),
             Self::EditUnsupported { path, reason } => {
                 if let Some(path) = path {
                     write!(f, "edit `{}`: {reason}", path.display())
@@ -889,7 +1114,7 @@ impl std::error::Error for DocumentError {
             Self::Open { source, .. } | Self::Map { source, .. } | Self::Write { source, .. } => {
                 Some(source)
             }
-            Self::EditUnsupported { .. } => None,
+            Self::Encoding { .. } | Self::EditUnsupported { .. } => None,
         }
     }
 }

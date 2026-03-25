@@ -3,10 +3,11 @@ use super::{
     SaveError,
 };
 use crate::{
-    CompactionPolicy, CompactionUrgency, DocumentBacking, DocumentError, EditCapability,
-    IdleCompactionOutcome, LiteralSearchQuery, MaintenanceAction, TextPosition, TextSelection,
-    ViewportRequest,
+    CompactionPolicy, CompactionUrgency, DocumentBacking, DocumentEncoding, DocumentError,
+    EditCapability, IdleCompactionOutcome, LiteralSearchQuery, MaintenanceAction, TextPosition,
+    TextSelection, ViewportRequest,
 };
+use encoding_rs::WINDOWS_1251;
 use std::fs;
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,96 @@ fn save_async_completes_and_clears_dirty_flag() {
     assert!(!tab.is_dirty());
     assert!(!tab.is_saving());
     assert!(fs::read(&path).unwrap().starts_with(b"123abc\ndef\n"));
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_open_file_with_encoding_exposes_decoded_text() {
+    let dir = std::env::temp_dir().join(format!("qem-editor-encoding-{}", std::process::id()));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("legacy-cp1251.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+    let (bytes, used, had_errors) = WINDOWS_1251.encode("привет\n");
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    fs::write(&path, bytes.as_ref()).unwrap();
+
+    let mut session = DocumentSession::new();
+    session
+        .open_file_with_encoding(path.clone(), encoding)
+        .unwrap();
+
+    assert_eq!(session.encoding(), encoding);
+    assert!(!session.decoding_had_errors());
+    assert_eq!(session.text(), "привет\n");
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_open_file_with_options_and_save_as_with_options_work() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-encoding-options-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("legacy-cp1251-options.txt");
+    let saved = dir.join("legacy-cp1251-options-saved.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+    let (bytes, used, had_errors) = WINDOWS_1251.encode("привет\n");
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    fs::write(&path, bytes.as_ref()).unwrap();
+
+    let mut session = DocumentSession::new();
+    session
+        .open_file_with_options(
+            path.clone(),
+            crate::DocumentOpenOptions::new().with_encoding(encoding),
+        )
+        .unwrap();
+    let _ = session
+        .try_insert(TextPosition::new(1, 0), "мир\n")
+        .unwrap();
+    session
+        .save_as_with_options(saved.clone(), crate::DocumentSaveOptions::new())
+        .unwrap();
+
+    let raw = fs::read(&saved).unwrap();
+    let (decoded, used, had_errors) = WINDOWS_1251.decode(&raw);
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    assert_eq!(decoded, "привет\nмир\n");
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&saved);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_open_file_with_auto_detection_handles_utf16le_bom() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-encoding-autodetect-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("utf16le-source.txt");
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in "hello\n".encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    fs::write(&path, bytes).unwrap();
+
+    let mut session = DocumentSession::new();
+    session
+        .open_file_with_auto_encoding_detection(path.clone())
+        .unwrap();
+
+    assert_eq!(session.encoding(), DocumentEncoding::utf16le());
+    assert_eq!(session.text(), "hello\n");
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
@@ -391,9 +482,10 @@ fn save_as_async_failure_preserves_dirty_state_and_clears_job() {
     let dir = std::env::temp_dir().join(format!("qem-editor-save-failure-{}", std::process::id()));
     let _ = fs::create_dir_all(&dir);
     let path = dir.join("large.txt");
-    let missing_parent = dir.join("missing");
-    let output = missing_parent.join("copy.txt");
+    let blocked_parent = dir.join("not-a-directory");
+    let output = blocked_parent.join("copy.txt");
     fs::write(&path, b"abc\ndef\n").unwrap();
+    fs::write(&blocked_parent, b"blocker").unwrap();
 
     let mut tab = EditorTab::new(2);
     tab.open_file(path.clone()).unwrap();
@@ -427,6 +519,7 @@ fn save_as_async_failure_preserves_dirty_state_and_clears_job() {
     assert!(!output.exists());
 
     let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&blocked_parent);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -596,9 +689,10 @@ fn editor_tab_close_file_while_async_save_failure_keeps_dirty_document_open() {
     ));
     let _ = fs::create_dir_all(&dir);
     let path = dir.join("close-save-failure.txt");
-    let missing_parent = dir.join("missing");
-    let output = missing_parent.join("copy.txt");
+    let blocked_parent = dir.join("not-a-directory");
+    let output = blocked_parent.join("copy.txt");
     fs::write(&path, b"abc\ndef\n").unwrap();
+    fs::write(&blocked_parent, b"blocker").unwrap();
 
     let mut tab = EditorTab::new(19);
     tab.open_file(path.clone()).unwrap();
@@ -652,6 +746,7 @@ fn editor_tab_close_file_while_async_save_failure_keeps_dirty_document_open() {
     assert_eq!(tab.generation(), generation.wrapping_add(1));
 
     let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&blocked_parent);
     let _ = fs::remove_dir_all(&dir);
 }
 

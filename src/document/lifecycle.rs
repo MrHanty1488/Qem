@@ -55,6 +55,30 @@ impl<'a> OpenProgressTracker<'a> {
     }
 }
 
+fn open_encoding_error(
+    path: &Path,
+    operation: &'static str,
+    encoding: DocumentEncoding,
+    message: impl Into<String>,
+) -> DocumentError {
+    DocumentError::Encoding {
+        path: path.to_path_buf(),
+        operation,
+        encoding,
+        message: message.into(),
+    }
+}
+
+fn auto_detect_open_encoding(bytes: &[u8]) -> Option<DocumentEncoding> {
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return Some(DocumentEncoding::utf16le());
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return Some(DocumentEncoding::utf16be());
+    }
+    None
+}
+
 impl Default for Document {
     fn default() -> Self {
         Self::new()
@@ -79,6 +103,8 @@ impl Document {
             indexed_bytes: Arc::new(AtomicUsize::new(0)),
             avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
             line_ending: LineEnding::Lf,
+            encoding: DocumentEncoding::utf8(),
+            decoding_had_errors: false,
             rope: None,
             piece_table: None,
             dirty: false,
@@ -94,19 +120,90 @@ impl Document {
     /// # Errors
     /// Returns [`DocumentError`] if the file cannot be opened or mapped.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, DocumentError> {
-        Self::open_with_progress(path, |_| {})
+        Self::open_with_options_and_progress(path, DocumentOpenOptions::new(), |_| {})
     }
 
+    /// Opens a file using explicit document-open options.
+    pub fn open_with_options(
+        path: impl Into<PathBuf>,
+        options: DocumentOpenOptions,
+    ) -> Result<Self, DocumentError> {
+        Self::open_with_options_and_progress(path, options, |_| {})
+    }
+
+    /// Opens a file using the lightweight auto-detect path.
+    ///
+    /// This currently recognizes BOM-backed UTF-16 sources and otherwise
+    /// falls back to the default UTF-8/ASCII fast path.
+    pub fn open_with_auto_encoding_detection(
+        path: impl Into<PathBuf>,
+    ) -> Result<Self, DocumentError> {
+        Self::open_with_options(
+            path,
+            DocumentOpenOptions::new().with_auto_encoding_detection(),
+        )
+    }
+
+    /// Opens a file using an explicit text encoding.
+    ///
+    /// This explicitly reinterprets the source bytes through `encoding`.
+    /// Non-UTF8 opens currently transcode the source into a rope-backed
+    /// document instead of using the mmap fast path.
+    pub fn open_with_encoding(
+        path: impl Into<PathBuf>,
+        encoding: DocumentEncoding,
+    ) -> Result<Self, DocumentError> {
+        Self::open_with_options(path, DocumentOpenOptions::new().with_encoding(encoding))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open_with_progress(
         path: impl Into<PathBuf>,
         mut progress: impl FnMut(u64),
     ) -> Result<Self, DocumentError> {
-        Self::open_with_reporting(path, &mut progress, &mut ignore_open_phase)
+        Self::open_with_options_and_reporting(
+            path,
+            DocumentOpenOptions::new(),
+            &mut progress,
+            &mut ignore_open_phase,
+        )
     }
 
+    pub(crate) fn open_with_options_and_progress(
+        path: impl Into<PathBuf>,
+        options: DocumentOpenOptions,
+        mut progress: impl FnMut(u64),
+    ) -> Result<Self, DocumentError> {
+        Self::open_with_options_and_reporting(path, options, &mut progress, &mut ignore_open_phase)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open_with_reporting(
         path: impl Into<PathBuf>,
         mut progress: impl FnMut(u64),
+        phase: &mut dyn FnMut(OpenProgressPhase),
+    ) -> Result<Self, DocumentError> {
+        Self::open_with_options_and_reporting(
+            path,
+            DocumentOpenOptions::new(),
+            &mut progress,
+            phase,
+        )
+    }
+
+    pub(crate) fn open_with_options_and_reporting(
+        path: impl Into<PathBuf>,
+        options: DocumentOpenOptions,
+        mut progress: impl FnMut(u64),
+        phase: &mut dyn FnMut(OpenProgressPhase),
+    ) -> Result<Self, DocumentError> {
+        Self::open_with_encoding_policy(path, options.encoding_policy(), &mut progress, phase)
+    }
+
+    fn open_with_encoding_policy(
+        path: impl Into<PathBuf>,
+        encoding_policy: OpenEncodingPolicy,
+        progress: &mut dyn FnMut(u64),
         phase: &mut dyn FnMut(OpenProgressPhase),
     ) -> Result<Self, DocumentError> {
         let path = path.into();
@@ -122,8 +219,24 @@ impl Document {
             },
         })?;
 
-        let mut tracker = OpenProgressTracker::new(storage.len() as u64, &mut progress);
-        let doc = Self::from_storage_with_progress(path, storage, &mut tracker, phase);
+        let mut tracker = OpenProgressTracker::new(storage.len() as u64, progress);
+        let bytes = storage.bytes();
+        let encoding = match encoding_policy {
+            OpenEncodingPolicy::Utf8FastPath => None,
+            OpenEncodingPolicy::AutoDetect => {
+                let inspected = bytes.len().min(2);
+                if inspected > 0 {
+                    tracker.report_inspected(inspected);
+                }
+                auto_detect_open_encoding(bytes)
+            }
+            OpenEncodingPolicy::Reinterpret(encoding) => Some(encoding),
+        };
+        let doc = if let Some(encoding) = encoding {
+            Self::from_storage_with_encoding(path, storage, encoding, &mut tracker, phase)?
+        } else {
+            Self::from_storage_with_progress(path, storage, &mut tracker, phase)
+        };
         phase(OpenProgressPhase::Ready);
         tracker.complete();
         Ok(doc)
@@ -134,6 +247,61 @@ impl Document {
         let mut progress = ignore_open_progress as fn(u64);
         let mut tracker = OpenProgressTracker::new(total_bytes, &mut progress);
         Self::from_storage_with_progress(path, storage, &mut tracker, &mut ignore_open_phase)
+    }
+
+    fn from_storage_with_encoding(
+        path: PathBuf,
+        storage: FileStorage,
+        encoding: DocumentEncoding,
+        progress: &mut OpenProgressTracker<'_>,
+        phase: &mut dyn FnMut(OpenProgressPhase),
+    ) -> Result<Self, DocumentError> {
+        if encoding.is_utf8() {
+            return Ok(Self::from_storage_with_progress(
+                path, storage, progress, phase,
+            ));
+        }
+        if storage.len() > MAX_ROPE_EDIT_FILE_BYTES {
+            return Err(open_encoding_error(
+                &path,
+                "open",
+                encoding,
+                format!(
+                    "non-UTF8 open currently requires full transcoding and is limited to {} bytes",
+                    MAX_ROPE_EDIT_FILE_BYTES
+                ),
+            ));
+        }
+
+        phase(OpenProgressPhase::InspectingSource);
+        let bytes = storage.bytes();
+        progress.report_inspected(bytes.len());
+        let (decoded, decoding_had_errors) = decode_text_with_encoding(bytes, encoding);
+        let line_ending = detect_line_ending_text(&decoded);
+        let rope = build_rope_from_decoded_text(&decoded);
+        let file_len = storage.len();
+        let indexed_bytes = Arc::new(AtomicUsize::new(file_len));
+        let avg_line_len = Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE));
+        let indexing = Arc::new(AtomicBool::new(false));
+        let line_offsets = Arc::new(RwLock::new(LineOffsets::new_for_file_len(file_len)));
+
+        Ok(Self {
+            path: Some(path),
+            storage: Some(storage),
+            line_offsets,
+            disk_index: None,
+            indexing,
+            indexing_started: Some(Instant::now()),
+            file_len,
+            indexed_bytes,
+            avg_line_len,
+            line_ending,
+            encoding,
+            decoding_had_errors,
+            rope: Some(rope),
+            piece_table: None,
+            dirty: false,
+        })
     }
 
     fn from_storage_with_progress(
@@ -199,6 +367,8 @@ impl Document {
                         indexed_bytes,
                         avg_line_len,
                         line_ending,
+                        encoding: DocumentEncoding::utf8(),
+                        decoding_had_errors: false,
                         rope: None,
                         piece_table: Some(PieceTable::from_recovered_session(
                             storage, add, pieces, meta,
@@ -229,6 +399,8 @@ impl Document {
                 indexed_bytes,
                 avg_line_len,
                 line_ending,
+                encoding: DocumentEncoding::utf8(),
+                decoding_had_errors: false,
                 rope: Some(Rope::new()),
                 piece_table: None,
                 dirty: false,
@@ -250,6 +422,8 @@ impl Document {
                 indexed_bytes,
                 avg_line_len,
                 line_ending,
+                encoding: DocumentEncoding::utf8(),
+                decoding_had_errors: false,
                 rope: None,
                 piece_table: None,
                 dirty: false,
@@ -438,6 +612,8 @@ impl Document {
             indexed_bytes,
             avg_line_len,
             line_ending,
+            encoding: DocumentEncoding::utf8(),
+            decoding_had_errors: false,
             rope: None,
             piece_table: None,
             dirty: false,

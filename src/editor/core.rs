@@ -344,34 +344,52 @@ impl SessionCore {
     }
 
     pub(super) fn open_file(&mut self, path: PathBuf) -> Result<(), DocumentError> {
+        self.open_file_with_options(path, DocumentOpenOptions::new())
+    }
+
+    pub(super) fn open_file_with_options(
+        &mut self,
+        path: PathBuf,
+        options: DocumentOpenOptions,
+    ) -> Result<(), DocumentError> {
+        let report_path = path.clone();
         if self.is_saving() {
             return Err(DocumentError::Write {
-                path,
+                path: report_path,
                 source: io::Error::other("cannot open while save is in progress"),
             });
         }
         if self.is_loading() {
             return Err(DocumentError::Open {
-                path,
+                path: report_path,
                 source: io::Error::other("cannot open while another load is in progress"),
             });
         }
-        let doc = Document::open(path)?;
+        let doc = Document::open_with_options(path, options)?;
         self.last_background_issue = None;
         self.finish_open(doc);
         Ok(())
     }
 
     pub(super) fn open_file_async(&mut self, path: PathBuf) -> Result<(), DocumentError> {
+        self.open_file_async_with_options(path, DocumentOpenOptions::new())
+    }
+
+    pub(super) fn open_file_async_with_options(
+        &mut self,
+        path: PathBuf,
+        options: DocumentOpenOptions,
+    ) -> Result<(), DocumentError> {
+        let report_path = path.clone();
         if self.is_saving() {
             return Err(DocumentError::Write {
-                path,
+                path: report_path,
                 source: io::Error::other("cannot open while save is in progress"),
             });
         }
         if self.is_loading() {
             return Err(DocumentError::Open {
-                path,
+                path: report_path,
                 source: io::Error::other("load already in progress"),
             });
         }
@@ -382,6 +400,7 @@ impl SessionCore {
         let job_path = Arc::new(path);
         let rx = spawn_load_worker(
             (*job_path).clone(),
+            options,
             total_bytes,
             Arc::clone(&loaded_bytes),
             Arc::clone(&phase),
@@ -459,13 +478,22 @@ impl SessionCore {
     }
 
     pub(super) fn save_as(&mut self, path: PathBuf) -> Result<(), DocumentError> {
+        self.save_as_with_options(path, DocumentSaveOptions::new())
+    }
+
+    pub(super) fn save_as_with_options(
+        &mut self,
+        path: PathBuf,
+        options: DocumentSaveOptions,
+    ) -> Result<(), DocumentError> {
+        let report_path = path.clone();
         if self.is_loading() {
             return Err(DocumentError::Write {
-                path,
+                path: report_path,
                 source: io::Error::other("cannot save while load is in progress"),
             });
         }
-        self.doc.save_to(&path)?;
+        self.doc.save_to_with_options(&path, options)?;
         self.last_background_issue = None;
         self.generation = self.generation.wrapping_add(1);
         Ok(())
@@ -543,10 +571,11 @@ impl SessionCore {
                     ));
                     Err(err)
                 } else {
-                    match self
-                        .doc
-                        .finish_save(completion.path, completion.reload_after_save)
-                    {
+                    match self.doc.finish_save(
+                        completion.path,
+                        completion.reload_after_save,
+                        completion.encoding,
+                    ) {
                         Ok(()) => {
                             self.last_background_issue = None;
                             if close_request == CloseRequest::AfterCurrentJob {
@@ -590,14 +619,27 @@ impl SessionCore {
         let Some(path) = self.current_path().map(|p| p.to_path_buf()) else {
             return Err(SaveError::NoPath);
         };
-        self.save_to_async(path).map_err(SaveError::Io)
+        self.save_to_async(path, DocumentSaveOptions::new())
+            .map_err(SaveError::Io)
     }
 
     pub(super) fn save_as_async(&mut self, path: PathBuf) -> Result<bool, DocumentError> {
-        self.save_to_async(path)
+        self.save_as_async_with_options(path, DocumentSaveOptions::new())
     }
 
-    pub(super) fn save_to_async(&mut self, path: PathBuf) -> Result<bool, DocumentError> {
+    pub(super) fn save_as_async_with_options(
+        &mut self,
+        path: PathBuf,
+        options: DocumentSaveOptions,
+    ) -> Result<bool, DocumentError> {
+        self.save_to_async(path, options)
+    }
+
+    pub(super) fn save_to_async(
+        &mut self,
+        path: PathBuf,
+        options: DocumentSaveOptions,
+    ) -> Result<bool, DocumentError> {
         if self.is_saving() {
             return Err(DocumentError::Write {
                 path,
@@ -615,7 +657,11 @@ impl SessionCore {
             return Ok(false);
         }
 
-        let prepared = self.doc.prepare_save(&path)?;
+        let prepared = self.doc.prepare_save_with_options_and_policy(
+            &path,
+            options,
+            Some(CompactionPolicy::default()),
+        )?;
         let total_bytes = prepared.total_bytes();
         let written_bytes = Arc::new(AtomicU64::new(0));
         let rx = spawn_save_worker(prepared, Arc::clone(&written_bytes));
@@ -688,6 +734,7 @@ fn map_open_phase(phase: OpenProgressPhase) -> LoadPhase {
 
 fn spawn_load_worker(
     path: PathBuf,
+    options: DocumentOpenOptions,
     total_bytes: u64,
     loaded_bytes: Arc<AtomicU64>,
     phase: Arc<AtomicU8>,
@@ -695,11 +742,13 @@ fn spawn_load_worker(
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         phase.store(LoadPhase::Opening.as_raw(), Ordering::Relaxed);
-        let result = Document::open_with_reporting(
+        let mut progress = |completed_bytes: u64| {
+            loaded_bytes.store(completed_bytes.min(total_bytes), Ordering::Relaxed);
+        };
+        let result = Document::open_with_options_and_reporting(
             path,
-            |completed_bytes| {
-                loaded_bytes.store(completed_bytes.min(total_bytes), Ordering::Relaxed);
-            },
+            options,
+            &mut progress,
             &mut |open_phase| {
                 phase.store(map_open_phase(open_phase).as_raw(), Ordering::Relaxed);
             },
@@ -714,6 +763,7 @@ fn background_issue_from_error(kind: BackgroundIssueKind, err: &DocumentError) -
         DocumentError::Open { path, source }
         | DocumentError::Map { path, source }
         | DocumentError::Write { path, source } => (path.clone(), source.to_string()),
+        DocumentError::Encoding { path, message, .. } => (path.clone(), message.clone()),
         DocumentError::EditUnsupported { path, reason } => {
             (path.clone().unwrap_or_default(), (*reason).to_string())
         }

@@ -50,6 +50,7 @@ impl PieceTableSnapshot {
 #[derive(Debug, Clone)]
 enum SaveSnapshot {
     Empty,
+    Bytes(Vec<u8>),
     Mmap(FileStorage),
     Rope { rope: Rope, line_ending: LineEnding },
     PieceTable(PieceTableSnapshot),
@@ -60,6 +61,7 @@ pub(crate) struct PreparedSave {
     path: PathBuf,
     total_bytes: u64,
     reload_after_save: bool,
+    encoding: DocumentEncoding,
     snapshot: SaveSnapshot,
 }
 
@@ -67,6 +69,7 @@ pub(crate) struct PreparedSave {
 pub(crate) struct SaveCompletion {
     pub path: PathBuf,
     pub reload_after_save: bool,
+    pub encoding: DocumentEncoding,
 }
 
 impl PreparedSave {
@@ -92,6 +95,7 @@ impl PreparedSave {
         Ok(SaveCompletion {
             path,
             reload_after_save: self.reload_after_save,
+            encoding: self.encoding,
         })
     }
 }
@@ -104,6 +108,7 @@ fn write_snapshot(
 ) -> io::Result<()> {
     match snapshot {
         SaveSnapshot::Empty => Ok(()),
+        SaveSnapshot::Bytes(bytes) => write_bytes_chunked(out, bytes, written, total),
         SaveSnapshot::Mmap(storage) => {
             write_bytes_chunked(out, storage.read_range(0, storage.len()), written, total)
         }
@@ -176,12 +181,46 @@ fn write_bytes_chunked(
     Ok(())
 }
 
+fn save_encoding_error(
+    path: &Path,
+    operation: &'static str,
+    encoding: DocumentEncoding,
+    message: impl Into<String>,
+) -> DocumentError {
+    DocumentError::Encoding {
+        path: path.to_path_buf(),
+        operation,
+        encoding,
+        message: message.into(),
+    }
+}
+
 pub(super) fn clear_session_sidecar(path: &Path) {
     let sidecar = editlog_path(path);
     let _ = std::fs::remove_file(sidecar);
 }
 
 impl Document {
+    fn rendered_text_for_save(&self) -> String {
+        if let Some(rope) = &self.rope {
+            return rope_text_with_line_endings(rope, self.line_ending);
+        }
+        if let Some(piece_table) = &self.piece_table {
+            return piece_table.to_string_lossy();
+        }
+        String::from_utf8_lossy(self.mmap_bytes()).to_string()
+    }
+
+    fn encoded_save_bytes(
+        &self,
+        path: &Path,
+        encoding: DocumentEncoding,
+    ) -> Result<Vec<u8>, DocumentError> {
+        let rendered = self.rendered_text_for_save();
+        encode_text_with_encoding(&rendered, encoding)
+            .map_err(|message| save_encoding_error(path, "save", encoding, message))
+    }
+
     /// Forces the current sidecar session state to disk.
     ///
     /// For mmap- or rope-backed documents without a piece-tree session, this is
@@ -291,27 +330,74 @@ impl Document {
         path: &Path,
         compaction_policy: Option<CompactionPolicy>,
     ) -> Result<PreparedSave, DocumentError> {
+        self.prepare_save_with_options_and_policy(
+            path,
+            DocumentSaveOptions::new(),
+            compaction_policy,
+        )
+    }
+
+    pub(crate) fn prepare_save_with_options_and_policy(
+        &mut self,
+        path: &Path,
+        options: DocumentSaveOptions,
+        compaction_policy: Option<CompactionPolicy>,
+    ) -> Result<PreparedSave, DocumentError> {
+        let encoding = match options.encoding_policy() {
+            SaveEncodingPolicy::Preserve => {
+                if !self.encoding.can_roundtrip_save() {
+                    return Err(save_encoding_error(
+                        path,
+                        "save",
+                        self.encoding,
+                        "preserve-save is not yet supported for this encoding; use DocumentSaveOptions::with_encoding(...) to convert to a supported target",
+                    ));
+                }
+                self.encoding
+            }
+            SaveEncodingPolicy::Convert(encoding) => encoding,
+        };
+        self.prepare_save_with_encoding_and_policy(path, encoding, compaction_policy)
+    }
+
+    pub(crate) fn prepare_save_with_encoding_and_policy(
+        &mut self,
+        path: &Path,
+        encoding: DocumentEncoding,
+        compaction_policy: Option<CompactionPolicy>,
+    ) -> Result<PreparedSave, DocumentError> {
         if let Some(policy) = compaction_policy {
             self.maybe_force_compact_before_save_with_policy(policy)?;
         }
 
-        let snapshot = if let Some(piece_table) = self.piece_table.as_ref() {
-            SaveSnapshot::PieceTable(PieceTableSnapshot::from_piece_table(piece_table))
-        } else if let Some(rope) = self.rope.as_ref() {
-            SaveSnapshot::Rope {
-                rope: rope.clone(),
-                line_ending: self.line_ending,
+        let snapshot = if encoding.is_utf8() && self.encoding.is_utf8() {
+            if let Some(piece_table) = self.piece_table.as_ref() {
+                SaveSnapshot::PieceTable(PieceTableSnapshot::from_piece_table(piece_table))
+            } else if let Some(rope) = self.rope.as_ref() {
+                SaveSnapshot::Rope {
+                    rope: rope.clone(),
+                    line_ending: self.line_ending,
+                }
+            } else if let Some(storage) = self.storage.as_ref() {
+                SaveSnapshot::Mmap(storage.clone())
+            } else {
+                SaveSnapshot::Empty
             }
-        } else if let Some(storage) = self.storage.as_ref() {
-            SaveSnapshot::Mmap(storage.clone())
         } else {
-            SaveSnapshot::Empty
+            SaveSnapshot::Bytes(self.encoded_save_bytes(path, encoding)?)
+        };
+
+        let total_bytes = match &snapshot {
+            SaveSnapshot::Empty => 0,
+            SaveSnapshot::Bytes(bytes) => bytes.len() as u64,
+            _ => self.file_len() as u64,
         };
 
         Ok(PreparedSave {
             path: path.to_path_buf(),
-            total_bytes: self.file_len() as u64,
+            total_bytes,
             reload_after_save: !self.has_edit_buffer(),
+            encoding,
             snapshot,
         })
     }
@@ -324,6 +410,7 @@ impl Document {
         &mut self,
         path: PathBuf,
         reload_after_save: bool,
+        encoding: DocumentEncoding,
     ) -> Result<(), DocumentError> {
         let previous_path = self.path.clone();
         self.indexing.store(false, Ordering::Relaxed);
@@ -333,25 +420,31 @@ impl Document {
             }
             clear_session_sidecar(&path);
             self.path = Some(path);
+            self.encoding = encoding;
+            self.decoding_had_errors = false;
             self.dirty = false;
             return Ok(());
         }
 
-        let fresh_storage = FileStorage::open(&path).map_err(|err| match err {
-            StorageOpenError::Open(source) => DocumentError::Open {
-                path: path.clone(),
-                source,
-            },
-            StorageOpenError::Map(source) => DocumentError::Map {
-                path: path.clone(),
-                source,
-            },
-        })?;
         if let Some(old_path) = previous_path.as_deref() {
             clear_session_sidecar(old_path);
         }
         clear_session_sidecar(&path);
-        *self = Self::from_storage(path, fresh_storage);
+        if encoding.is_utf8() {
+            let fresh_storage = FileStorage::open(&path).map_err(|err| match err {
+                StorageOpenError::Open(source) => DocumentError::Open {
+                    path: path.clone(),
+                    source,
+                },
+                StorageOpenError::Map(source) => DocumentError::Map {
+                    path: path.clone(),
+                    source,
+                },
+            })?;
+            *self = Self::from_storage(path, fresh_storage);
+        } else {
+            *self = Self::open_with_encoding(path, encoding)?;
+        }
         Ok(())
     }
 
@@ -366,6 +459,38 @@ impl Document {
     pub fn save_to(&mut self, path: &Path) -> Result<(), DocumentError> {
         let prepared = self.prepare_save(path)?;
         let completion = prepared.execute(Arc::new(AtomicU64::new(0)))?;
-        self.finish_save(completion.path, completion.reload_after_save)
+        self.finish_save(
+            completion.path,
+            completion.reload_after_save,
+            completion.encoding,
+        )
+    }
+
+    /// Saves the document to the specified path using explicit save options.
+    pub fn save_to_with_options(
+        &mut self,
+        path: &Path,
+        options: DocumentSaveOptions,
+    ) -> Result<(), DocumentError> {
+        let prepared = self.prepare_save_with_options_and_policy(
+            path,
+            options,
+            Some(CompactionPolicy::default()),
+        )?;
+        let completion = prepared.execute(Arc::new(AtomicU64::new(0)))?;
+        self.finish_save(
+            completion.path,
+            completion.reload_after_save,
+            completion.encoding,
+        )
+    }
+
+    /// Saves the document to the specified path using an explicit target encoding.
+    pub fn save_to_with_encoding(
+        &mut self,
+        path: &Path,
+        encoding: DocumentEncoding,
+    ) -> Result<(), DocumentError> {
+        self.save_to_with_options(path, DocumentSaveOptions::new().with_encoding(encoding))
     }
 }

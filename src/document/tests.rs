@@ -1,5 +1,6 @@
 use super::lifecycle::OpenProgressPhase;
 use super::*;
+use encoding_rs::WINDOWS_1251;
 use proptest::prelude::*;
 use std::io::Write;
 use tempfile::tempdir;
@@ -451,6 +452,8 @@ fn precise_piece_table_line_lengths_require_complete_index() {
         indexed_bytes: Arc::new(AtomicUsize::new(4)),
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        decoding_had_errors: false,
         rope: None,
         piece_table: None,
         dirty: false,
@@ -477,6 +480,8 @@ fn precise_piece_table_line_lengths_reject_large_line_arrays() {
         indexed_bytes: Arc::new(AtomicUsize::new(LINE_LENGTHS_MAX_SYNC_LINES + 1)),
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        decoding_had_errors: false,
         rope: None,
         piece_table: None,
         dirty: false,
@@ -507,6 +512,8 @@ fn piece_table_line_lengths_for_edit_builds_partial_prefix() {
         indexed_bytes: Arc::new(AtomicUsize::new(0)),
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        decoding_had_errors: false,
         rope: None,
         piece_table: None,
         dirty: false,
@@ -588,6 +595,8 @@ fn piece_table_line_lengths_for_edit_supports_large_exact_prefix() {
         indexed_bytes: Arc::new(AtomicUsize::new(LINE_LENGTHS_MAX_SYNC_LINES + 1)),
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        decoding_had_errors: false,
         rope: None,
         piece_table: None,
         dirty: false,
@@ -626,6 +635,8 @@ fn insert_uses_partial_piece_table_before_full_index_finishes() {
         indexed_bytes: Arc::new(AtomicUsize::new(0)),
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        decoding_had_errors: false,
         rope: None,
         piece_table: None,
         dirty: false,
@@ -669,6 +680,8 @@ fn insert_fully_indexes_medium_unindexed_piece_table_documents() {
         indexed_bytes: Arc::new(AtomicUsize::new(0)),
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        decoding_had_errors: false,
         rope: None,
         piece_table: None,
         dirty: false,
@@ -848,9 +861,10 @@ fn save_to_failure_preserves_dirty_state_and_current_path() {
     let dir = std::env::temp_dir().join(format!("qem-save-failure-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let src = dir.join("source.txt");
-    let missing_parent = dir.join("missing");
-    let dst = missing_parent.join("copy.txt");
+    let blocked_parent = dir.join("not-a-directory");
+    let dst = blocked_parent.join("copy.txt");
     std::fs::write(&src, b"alpha\nbeta\n").unwrap();
+    std::fs::write(&blocked_parent, b"blocker").unwrap();
 
     let mut doc = Document::open(src.clone()).unwrap();
     let _ = doc.try_insert_text_at(0, 0, "123").unwrap();
@@ -864,6 +878,7 @@ fn save_to_failure_preserves_dirty_state_and_current_path() {
     assert!(!dst.exists());
 
     let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&blocked_parent);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1047,6 +1062,8 @@ fn document_compact_piece_table_preserves_recovery_and_clears_recommendation() {
         indexed_bytes: Arc::new(AtomicUsize::new(0)),
         avg_line_len: Arc::new(AtomicUsize::new(1)),
         line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        decoding_had_errors: false,
         rope: None,
         piece_table: Some(piece_table),
         dirty: true,
@@ -1211,6 +1228,8 @@ fn prepare_save_with_forced_compaction_policy_compacts_before_snapshotting() {
         indexed_bytes: Arc::new(AtomicUsize::new(0)),
         avg_line_len: Arc::new(AtomicUsize::new(1)),
         line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        decoding_had_errors: false,
         rope: None,
         piece_table: Some(piece_table),
         dirty: true,
@@ -1224,10 +1243,178 @@ fn prepare_save_with_forced_compaction_policy_compacts_before_snapshotting() {
     assert_eq!(after.piece_count, 1);
 
     let completion = prepared.execute(Arc::new(AtomicU64::new(0))).unwrap();
-    doc.finish_save(completion.path, completion.reload_after_save)
-        .unwrap();
+    doc.finish_save(
+        completion.path,
+        completion.reload_after_save,
+        completion.encoding,
+    )
+    .unwrap();
 
     assert_eq!(std::fs::read_to_string(&target).unwrap(), expected_text);
+}
+
+#[test]
+fn open_with_encoding_preserves_legacy_text_and_default_save_round_trips() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy-cp1251.txt");
+    let saved = dir.path().join("legacy-cp1251-saved.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+    let source_text = "привет\nмир\n";
+    let (bytes, used, had_errors) = WINDOWS_1251.encode(source_text);
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    std::fs::write(&path, bytes.as_ref()).unwrap();
+
+    let mut doc = Document::open_with_encoding(path.clone(), encoding).unwrap();
+    assert_eq!(doc.encoding(), encoding);
+    assert!(!doc.decoding_had_errors());
+    assert_eq!(doc.text_lossy(), source_text);
+
+    let edit = doc.try_insert_text_at(0, 0, "эй, ").unwrap();
+    assert_eq!(edit, (0, 4));
+    doc.save_to(&saved).unwrap();
+
+    let raw = std::fs::read(&saved).unwrap();
+    let (decoded, used, had_errors) = WINDOWS_1251.decode(&raw);
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    assert_eq!(decoded, "эй, привет\nмир\n");
+}
+
+#[test]
+fn open_with_options_and_save_options_preserve_encoding_contract() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy-cp1251-options.txt");
+    let saved = dir.path().join("legacy-cp1251-options-saved.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+    let (bytes, used, had_errors) = WINDOWS_1251.encode("данные\n");
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    std::fs::write(&path, bytes.as_ref()).unwrap();
+
+    let mut doc =
+        Document::open_with_options(path, DocumentOpenOptions::new().with_encoding(encoding))
+            .unwrap();
+    let _ = doc.try_insert_text_at(1, 0, "ещё\n").unwrap();
+    doc.save_to_with_options(&saved, DocumentSaveOptions::new())
+        .unwrap();
+
+    let raw = std::fs::read(&saved).unwrap();
+    let (decoded, used, had_errors) = WINDOWS_1251.decode(&raw);
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    assert_eq!(decoded, "данные\nещё\n");
+}
+
+#[test]
+fn open_with_options_reinterpretation_decodes_legacy_bytes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy-windows-1252.txt");
+    let encoding = DocumentEncoding::from_label("windows-1252").unwrap();
+    std::fs::write(&path, b"caf\xe9\n").unwrap();
+
+    let doc = Document::open_with_options(
+        path,
+        DocumentOpenOptions::new().with_reinterpretation(encoding),
+    )
+    .unwrap();
+
+    assert_eq!(doc.encoding(), encoding);
+    assert_eq!(doc.text_lossy(), "café\n");
+}
+
+#[test]
+fn open_with_options_auto_detects_utf16le_bom_and_allows_utf8_convert_save() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("utf16le-source.txt");
+    let saved = dir.path().join("utf16le-converted.txt");
+    let source_text = "hello\nworld\n";
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in source_text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut doc = Document::open_with_auto_encoding_detection(path).unwrap();
+    assert_eq!(doc.encoding(), DocumentEncoding::utf16le());
+    assert_eq!(doc.text_lossy(), source_text);
+
+    let _ = doc.try_insert_text_at(0, 0, "header\n").unwrap();
+    doc.save_to_with_options(
+        &saved,
+        DocumentSaveOptions::new().with_encoding(DocumentEncoding::utf8()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&saved).unwrap(),
+        "header\nhello\nworld\n"
+    );
+    assert_eq!(doc.encoding(), DocumentEncoding::utf8());
+    assert!(!doc.decoding_had_errors());
+}
+
+#[test]
+fn preserve_save_reports_unsupported_contract_for_utf16_source() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("utf16le-preserve.txt");
+    let saved = dir.path().join("utf16le-preserve-saved.txt");
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in "hello\n".encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut doc = Document::open_with_auto_encoding_detection(path).unwrap();
+    let err = doc.save_to(&saved).unwrap_err();
+    assert!(matches!(
+        err,
+        DocumentError::Encoding {
+            path: failed_path,
+            operation: "save",
+            encoding,
+            ..
+        } if failed_path == saved && encoding == DocumentEncoding::utf16le()
+    ));
+}
+
+#[test]
+fn save_to_with_encoding_converts_utf8_document() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("converted-cp1251.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+    let mut doc = Document::new();
+    doc.try_insert_text_at(0, 0, "тест\n").unwrap();
+
+    doc.save_to_with_encoding(&path, encoding).unwrap();
+
+    assert_eq!(doc.encoding(), encoding);
+    assert!(!doc.decoding_had_errors());
+    let raw = std::fs::read(&path).unwrap();
+    let (decoded, used, had_errors) = WINDOWS_1251.decode(&raw);
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    assert_eq!(decoded, "тест\n");
+}
+
+#[test]
+fn save_to_with_encoding_rejects_unrepresentable_text() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("emoji-cp1251.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+    let mut doc = Document::new();
+    doc.try_insert_text_at(0, 0, "emoji 🙂\n").unwrap();
+
+    let err = doc.save_to_with_encoding(&path, encoding).unwrap_err();
+    assert!(matches!(
+        err,
+        DocumentError::Encoding {
+            path: failed_path,
+            operation: "save",
+            encoding: failed_encoding,
+            ..
+        } if failed_path == path && failed_encoding == encoding
+    ));
 }
 
 #[test]
@@ -1426,6 +1613,8 @@ fn line_slices_near_tail_read_from_file_end_before_full_index() {
         indexed_bytes: Arc::new(AtomicUsize::new(0)),
         avg_line_len: Arc::new(AtomicUsize::new(2)),
         line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        decoding_had_errors: false,
         rope: None,
         piece_table: None,
         dirty: false,
@@ -1481,6 +1670,8 @@ fn line_slices_bail_out_when_next_line_scan_would_be_unbounded() {
         indexed_bytes: Arc::new(AtomicUsize::new(0)),
         avg_line_len: Arc::new(AtomicUsize::new(1)),
         line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        decoding_had_errors: false,
         rope: None,
         piece_table: None,
         dirty: false,
@@ -1510,6 +1701,8 @@ fn indexing_progress_reports_inflight_state() {
         indexed_bytes: Arc::new(AtomicUsize::new(32)),
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        decoding_had_errors: false,
         rope: None,
         piece_table: None,
         dirty: false,
@@ -1864,6 +2057,8 @@ fn try_insert_rejects_large_piece_table_promotion_to_rope() {
         indexed_bytes: Arc::new(AtomicUsize::new(0)),
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        decoding_had_errors: false,
         rope: None,
         piece_table: Some(PieceTable {
             original: storage,
@@ -2695,6 +2890,8 @@ fn edit_capability_reports_partial_piece_table_promotion_limits() {
         indexed_bytes: Arc::new(AtomicUsize::new(0)),
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        decoding_had_errors: false,
         rope: None,
         piece_table: Some(PieceTable {
             original: storage,

@@ -189,6 +189,16 @@ impl DocumentSession {
         self.core.document().line_ending()
     }
 
+    /// Returns the current document encoding contract.
+    pub fn encoding(&self) -> DocumentEncoding {
+        self.core.document().encoding()
+    }
+
+    /// Returns `true` when the last open required replacement-character decoding.
+    pub fn decoding_had_errors(&self) -> bool {
+        self.core.document().decoding_had_errors()
+    }
+
     /// Returns the visible line length in text columns, excluding line endings.
     pub fn line_len_chars(&self, line0: usize) -> usize {
         self.core.document().line_len_chars(line0)
@@ -641,9 +651,67 @@ impl DocumentSession {
         self.core.open_file(path)
     }
 
+    /// Opens a file synchronously using explicit open options.
+    pub fn open_file_with_options(
+        &mut self,
+        path: PathBuf,
+        options: DocumentOpenOptions,
+    ) -> Result<(), DocumentError> {
+        self.core.open_file_with_options(path, options)
+    }
+
+    /// Opens a file synchronously using the lightweight auto-detect path.
+    pub fn open_file_with_auto_encoding_detection(
+        &mut self,
+        path: PathBuf,
+    ) -> Result<(), DocumentError> {
+        self.open_file_with_options(
+            path,
+            DocumentOpenOptions::new().with_auto_encoding_detection(),
+        )
+    }
+
+    /// Opens a file synchronously using an explicit text encoding.
+    pub fn open_file_with_encoding(
+        &mut self,
+        path: PathBuf,
+        encoding: DocumentEncoding,
+    ) -> Result<(), DocumentError> {
+        self.open_file_with_options(path, DocumentOpenOptions::new().with_encoding(encoding))
+    }
+
     /// Starts opening a file on a background worker.
     pub fn open_file_async(&mut self, path: PathBuf) -> Result<(), DocumentError> {
         self.core.open_file_async(path)
+    }
+
+    /// Starts opening a file on a background worker using explicit open options.
+    pub fn open_file_async_with_options(
+        &mut self,
+        path: PathBuf,
+        options: DocumentOpenOptions,
+    ) -> Result<(), DocumentError> {
+        self.core.open_file_async_with_options(path, options)
+    }
+
+    /// Starts opening a file on a background worker using the lightweight auto-detect path.
+    pub fn open_file_async_with_auto_encoding_detection(
+        &mut self,
+        path: PathBuf,
+    ) -> Result<(), DocumentError> {
+        self.open_file_async_with_options(
+            path,
+            DocumentOpenOptions::new().with_auto_encoding_detection(),
+        )
+    }
+
+    /// Starts opening a file on a background worker using an explicit encoding.
+    pub fn open_file_async_with_encoding(
+        &mut self,
+        path: PathBuf,
+        encoding: DocumentEncoding,
+    ) -> Result<(), DocumentError> {
+        self.open_file_async_with_options(path, DocumentOpenOptions::new().with_encoding(encoding))
     }
 
     /// Closes the current document and replaces it with an empty one.
@@ -674,6 +742,24 @@ impl DocumentSession {
     /// Saves the document synchronously to a new path.
     pub fn save_as(&mut self, path: PathBuf) -> Result<(), DocumentError> {
         self.core.save_as(path)
+    }
+
+    /// Saves the document synchronously to a new path using explicit save options.
+    pub fn save_as_with_options(
+        &mut self,
+        path: PathBuf,
+        options: DocumentSaveOptions,
+    ) -> Result<(), DocumentError> {
+        self.core.save_as_with_options(path, options)
+    }
+
+    /// Saves the document synchronously to a new path using an explicit target encoding.
+    pub fn save_as_with_encoding(
+        &mut self,
+        path: PathBuf,
+        encoding: DocumentEncoding,
+    ) -> Result<(), DocumentError> {
+        self.save_as_with_options(path, DocumentSaveOptions::new().with_encoding(encoding))
     }
 
     /// Sets the document path without saving.
@@ -718,6 +804,24 @@ impl DocumentSession {
     /// edited buffers, the call itself can therefore take noticeable time.
     pub fn save_as_async(&mut self, path: PathBuf) -> Result<bool, DocumentError> {
         self.core.save_as_async(path)
+    }
+
+    /// Starts a background save to a new path using explicit save options.
+    pub fn save_as_async_with_options(
+        &mut self,
+        path: PathBuf,
+        options: DocumentSaveOptions,
+    ) -> Result<bool, DocumentError> {
+        self.core.save_as_async_with_options(path, options)
+    }
+
+    /// Starts a background save to a new path using an explicit target encoding.
+    pub fn save_as_async_with_encoding(
+        &mut self,
+        path: PathBuf,
+        encoding: DocumentEncoding,
+    ) -> Result<bool, DocumentError> {
+        self.save_as_async_with_options(path, DocumentSaveOptions::new().with_encoding(encoding))
     }
 
     /// Returns the current background activity for the session.
