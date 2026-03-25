@@ -45,14 +45,14 @@ next `Document::open`, as long as the source file identity still matches.
 
 ```toml
 [dependencies]
-qem = "0.5.3"
+qem = "0.5.4"
 ```
 
 To disable the editor/session wrapper and use only the document/storage layer:
 
 ```toml
 [dependencies]
-qem = { version = "0.5.3", default-features = false }
+qem = { version = "0.5.4", default-features = false }
 ```
 
 ## Cargo features
@@ -69,7 +69,7 @@ Example:
 
 ```toml
 [dependencies]
-qem = { version = "0.5.3", default-features = false, features = ["editor", "tmp-exe-dir"] }
+qem = { version = "0.5.4", default-features = false, features = ["editor", "tmp-exe-dir"] }
 ```
 
 Runtime override is also available:
@@ -170,6 +170,15 @@ cargo run --example frontend_session --features editor -- input.txt output.txt
 - Sidecar recovery trusts the source file identity, currently defined as file
   length, modification time, and a sampled content fingerprint.
 - The minimum supported Rust version for this release line is `1.85`.
+
+## Roadmap
+
+- `0.5.4`: patch-only if needed: bug fixes and docs/readme cleanup.
+- `0.6.0`: Encoding Contract & Data Integrity.
+- `0.7.0`: Advanced Text Semantics.
+- `0.8.0`: Stable Extension Surface.
+- Ongoing: public benchmarks, honest `1TB` caveats, and more
+  recovery/huge-file-search regression coverage.
 
 ## Examples
 

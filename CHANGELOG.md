@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.4
+
+### Changed
+
+- Tightened the public README roadmap into a short release-plan summary instead
+  of a larger planning dump.
+- README installation examples now point at the current `0.5.4` release.
+
 ## 0.5.3
 
 ### Added
