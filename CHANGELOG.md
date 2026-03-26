@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.6.0
+
+### Added
+
+- Added typed encoding provenance through `DocumentEncodingOrigin`, including
+  `auto-detected`, `auto-detect-fallback`, explicit reinterpretation, and
+  save-conversion paths on `Document`, `DocumentSession`, `EditorTab`, and
+  their status snapshots.
+- Added preserve-save and explicit-conversion preflight helpers through
+  `preserve_save_error()`, `can_preserve_save()`,
+  `save_error_for_options()`, and `save_error_for_encoding()` across the
+  document/session/tab surfaces.
+- Added recovery metadata for UTF-8 session sidecars so reopened `.qem.editlog`
+  sessions preserve encoding origin and lossy-decode hints instead of silently
+  collapsing back to the default fast-path origin.
+
+### Changed
+
+- Tightened the open/save encoding contract around `detect vs explicit
+  override`, `reinterpret vs convert`, and explicit `SaveConversion`
+  semantics, including same-path async conversion flows that must not degrade
+  into no-op preserve saves.
+- `decoding_had_errors()` is now reported more truthfully for fully inspected
+  small UTF-8 opens, while preserve-save stays allowed when Qem can still write
+  raw source bytes without materializing lossy-decoded text.
+- Public docs now describe the sharper distinction between `decoding_had_errors`
+  and `LossyDecodedPreserve`, so frontends can treat "source was malformed" and
+  "this preserve-save would lose data" as separate states.
+
+### Fixed
+
+- Preserve-save now returns structured typed errors for lossy-decoded legacy
+  opens, unsupported preserve targets, unrepresentable edited text, and other
+  save-contract failures instead of relying on implicit or silent behavior.
+- Explicit `convert to UTF-8` now performs a real conversion even when the
+  current document contract already reports UTF-8, preventing raw-byte copies
+  from leaking through invalid UTF-8 sanitize flows.
+- UTF-8 materialization paths now mark lossy decode correctly when invalid bytes
+  are pulled into rope-backed editing, preventing later preserve-save from
+  silently committing replacement-character text back to disk.
+- Expanded regression coverage across `windows-1251`, `Shift_JIS`, `GB18030`,
+  `UTF-16LE`, `UTF-16BE`, piece-table recovery/save flows, and async
+  session/tab save behavior.
+
 ## 0.5.4
 
 ### Changed

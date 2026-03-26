@@ -575,6 +575,7 @@ impl SessionCore {
                         completion.path,
                         completion.reload_after_save,
                         completion.encoding,
+                        completion.encoding_origin,
                     ) {
                         Ok(()) => {
                             self.last_background_issue = None;
@@ -653,7 +654,13 @@ impl SessionCore {
             });
         }
 
-        if !self.doc.is_dirty() && self.current_path() == Some(path.as_path()) {
+        if !self.doc.is_dirty()
+            && self.current_path() == Some(path.as_path())
+            && matches!(
+                options.encoding_policy(),
+                crate::SaveEncodingPolicy::Preserve
+            )
+        {
             return Ok(false);
         }
 
@@ -763,7 +770,7 @@ fn background_issue_from_error(kind: BackgroundIssueKind, err: &DocumentError) -
         DocumentError::Open { path, source }
         | DocumentError::Map { path, source }
         | DocumentError::Write { path, source } => (path.clone(), source.to_string()),
-        DocumentError::Encoding { path, message, .. } => (path.clone(), message.clone()),
+        DocumentError::Encoding { path, reason, .. } => (path.clone(), reason.to_string()),
         DocumentError::EditUnsupported { path, reason } => {
             (path.clone().unwrap_or_default(), (*reason).to_string())
         }

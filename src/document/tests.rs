@@ -1,6 +1,6 @@
 use super::lifecycle::OpenProgressPhase;
 use super::*;
-use encoding_rs::WINDOWS_1251;
+use encoding_rs::{GB18030, SHIFT_JIS, WINDOWS_1251};
 use proptest::prelude::*;
 use std::io::Write;
 use tempfile::tempdir;
@@ -453,7 +453,9 @@ fn precise_piece_table_line_lengths_require_complete_index() {
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
         decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
         rope: None,
         piece_table: None,
         dirty: false,
@@ -481,7 +483,9 @@ fn precise_piece_table_line_lengths_reject_large_line_arrays() {
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
         decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
         rope: None,
         piece_table: None,
         dirty: false,
@@ -513,7 +517,9 @@ fn piece_table_line_lengths_for_edit_builds_partial_prefix() {
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
         decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
         rope: None,
         piece_table: None,
         dirty: false,
@@ -596,7 +602,9 @@ fn piece_table_line_lengths_for_edit_supports_large_exact_prefix() {
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
         decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
         rope: None,
         piece_table: None,
         dirty: false,
@@ -636,7 +644,9 @@ fn insert_uses_partial_piece_table_before_full_index_finishes() {
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
         decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
         rope: None,
         piece_table: None,
         dirty: false,
@@ -681,7 +691,9 @@ fn insert_fully_indexes_medium_unindexed_piece_table_documents() {
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
         decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
         rope: None,
         piece_table: None,
         dirty: false,
@@ -1063,7 +1075,9 @@ fn document_compact_piece_table_preserves_recovery_and_clears_recommendation() {
         avg_line_len: Arc::new(AtomicUsize::new(1)),
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
         decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
         rope: None,
         piece_table: Some(piece_table),
         dirty: true,
@@ -1229,7 +1243,9 @@ fn prepare_save_with_forced_compaction_policy_compacts_before_snapshotting() {
         avg_line_len: Arc::new(AtomicUsize::new(1)),
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
         decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
         rope: None,
         piece_table: Some(piece_table),
         dirty: true,
@@ -1247,6 +1263,7 @@ fn prepare_save_with_forced_compaction_policy_compacts_before_snapshotting() {
         completion.path,
         completion.reload_after_save,
         completion.encoding,
+        completion.encoding_origin,
     )
     .unwrap();
 
@@ -1267,6 +1284,10 @@ fn open_with_encoding_preserves_legacy_text_and_default_save_round_trips() {
 
     let mut doc = Document::open_with_encoding(path.clone(), encoding).unwrap();
     assert_eq!(doc.encoding(), encoding);
+    assert_eq!(
+        doc.encoding_origin(),
+        DocumentEncodingOrigin::ExplicitReinterpretation
+    );
     assert!(!doc.decoding_had_errors());
     assert_eq!(doc.text_lossy(), source_text);
 
@@ -1324,6 +1345,226 @@ fn open_with_options_reinterpretation_decodes_legacy_bytes() {
 }
 
 #[test]
+fn open_with_encoding_shift_jis_preserves_text_and_default_save_round_trips() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy-shift-jis.txt");
+    let saved = dir.path().join("legacy-shift-jis-saved.txt");
+    let encoding = DocumentEncoding::from_label("shift_jis").unwrap();
+    let source_text = "\u{65E5}\u{672C}\u{8A9E}\n";
+    let inserted_text = "\u{8FFD}\u{52A0}\n";
+    let expected_text = format!("{inserted_text}{source_text}");
+    let (bytes, used, had_errors) = SHIFT_JIS.encode(source_text);
+    assert_eq!(used, SHIFT_JIS);
+    assert!(!had_errors);
+    std::fs::write(&path, bytes.as_ref()).unwrap();
+
+    let mut doc = Document::open_with_encoding(path.clone(), encoding).unwrap();
+    assert_eq!(doc.encoding(), encoding);
+    assert_eq!(
+        doc.encoding_origin(),
+        DocumentEncodingOrigin::ExplicitReinterpretation
+    );
+    assert!(!doc.decoding_had_errors());
+    assert_eq!(doc.text_lossy(), source_text);
+
+    let _ = doc.try_insert_text_at(0, 0, inserted_text).unwrap();
+    doc.save_to(&saved).unwrap();
+
+    let raw = std::fs::read(&saved).unwrap();
+    let (decoded, used, had_errors) = SHIFT_JIS.decode(&raw);
+    assert_eq!(used, SHIFT_JIS);
+    assert!(!had_errors);
+    assert_eq!(decoded, expected_text);
+}
+
+#[test]
+fn preserve_save_rejects_lossy_shift_jis_source() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("lossy-shift-jis.txt");
+    let saved = dir.path().join("lossy-shift-jis-saved.txt");
+    let encoding = DocumentEncoding::from_label("shift_jis").unwrap();
+    std::fs::write(&path, [0x82]).unwrap();
+
+    let mut doc = Document::open_with_encoding(path, encoding).unwrap();
+
+    assert_eq!(doc.encoding(), encoding);
+    assert_eq!(
+        doc.encoding_origin(),
+        DocumentEncodingOrigin::ExplicitReinterpretation
+    );
+    assert!(doc.decoding_had_errors());
+    assert_eq!(doc.text_lossy(), "\u{FFFD}");
+
+    let err = doc.save_to(&saved).unwrap_err();
+    assert!(matches!(
+        err,
+        DocumentError::Encoding {
+            path: failed_path,
+            operation: "save",
+            encoding: failed_encoding,
+            reason: DocumentEncodingErrorKind::LossyDecodedPreserve,
+        } if failed_path == saved && failed_encoding == encoding
+    ));
+}
+
+#[test]
+fn lossy_shift_jis_source_can_be_explicitly_converted_to_utf8() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("lossy-shift-jis-convert.txt");
+    let saved = dir.path().join("lossy-shift-jis-convert-saved.txt");
+    let encoding = DocumentEncoding::from_label("shift_jis").unwrap();
+    std::fs::write(&path, [0x82]).unwrap();
+
+    let mut doc = Document::open_with_encoding(path, encoding).unwrap();
+    assert!(doc.decoding_had_errors());
+
+    doc.save_to_with_encoding(&saved, DocumentEncoding::utf8())
+        .unwrap();
+
+    assert_eq!(doc.encoding(), DocumentEncoding::utf8());
+    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert!(!doc.decoding_had_errors());
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), "\u{FFFD}");
+}
+
+#[test]
+fn invalid_utf8_inline_open_tracks_lossy_decode_but_preserve_save_stays_raw_safe() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("invalid-utf8-inline-open.txt");
+    let saved = dir.path().join("invalid-utf8-inline-open-saved.txt");
+    let bytes = [0x66, 0x6f, 0x80, 0x6f, b'\n'];
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut doc = Document::open(path).unwrap();
+    assert_eq!(doc.encoding(), DocumentEncoding::utf8());
+    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::Utf8FastPath);
+    assert!(doc.decoding_had_errors());
+    assert!(doc.can_preserve_save());
+    assert_eq!(doc.preserve_save_error(), None);
+    assert!(doc.status().decoding_had_errors());
+    assert_eq!(doc.text_lossy(), "fo\u{FFFD}o\n");
+
+    doc.save_to(&saved).unwrap();
+
+    assert_eq!(std::fs::read(&saved).unwrap(), bytes);
+}
+
+#[test]
+fn invalid_utf8_fast_path_can_be_explicitly_converted_to_clean_utf8_without_edits() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("invalid-utf8-fast-path-convert.txt");
+    let saved = dir.path().join("invalid-utf8-fast-path-converted.txt");
+    std::fs::write(&path, [0x66, 0x6f, 0x80, 0x6f, b'\n']).unwrap();
+
+    let mut doc = Document::open(path).unwrap();
+    assert_eq!(doc.encoding(), DocumentEncoding::utf8());
+    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::Utf8FastPath);
+    assert!(doc.decoding_had_errors());
+    assert!(!doc.has_edit_buffer());
+
+    doc.save_to_with_encoding(&saved, DocumentEncoding::utf8())
+        .unwrap();
+
+    assert_eq!(doc.path(), Some(saved.as_path()));
+    assert_eq!(doc.encoding(), DocumentEncoding::utf8());
+    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert!(!doc.decoding_had_errors());
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), "fo\u{FFFD}o\n");
+}
+
+#[test]
+fn edited_invalid_utf8_fast_path_becomes_lossy_preserve_rejecting() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("invalid-utf8-fast-path.txt");
+    let saved = dir.path().join("invalid-utf8-fast-path-saved.txt");
+    std::fs::write(&path, [0x66, 0x6f, 0x80, 0x6f, b'\n']).unwrap();
+
+    let mut doc = Document::open(path).unwrap();
+    assert_eq!(doc.encoding(), DocumentEncoding::utf8());
+    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::Utf8FastPath);
+    assert!(doc.decoding_had_errors());
+    assert!(doc.can_preserve_save());
+
+    let _ = doc.try_insert_text_at(0, 0, "X").unwrap();
+
+    assert!(doc.decoding_had_errors());
+    assert_eq!(
+        doc.preserve_save_error(),
+        Some(DocumentEncodingErrorKind::LossyDecodedPreserve)
+    );
+    assert_eq!(
+        doc.save_error_for_options(DocumentSaveOptions::new()),
+        Some(DocumentEncodingErrorKind::LossyDecodedPreserve)
+    );
+
+    let err = doc.save_to(&saved).unwrap_err();
+    assert!(matches!(
+        err,
+        DocumentError::Encoding {
+            path: failed_path,
+            operation: "save",
+            encoding,
+            reason: DocumentEncodingErrorKind::LossyDecodedPreserve,
+        } if failed_path == saved && encoding == DocumentEncoding::utf8()
+    ));
+
+    doc.save_to_with_encoding(&saved, DocumentEncoding::utf8())
+        .unwrap();
+    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert!(!doc.decoding_had_errors());
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), "Xfo\u{FFFD}o\n");
+}
+
+#[test]
+fn piece_table_invalid_utf8_fast_path_converts_to_clean_utf8() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("invalid-utf8-piece-table-source.txt");
+    let saved = dir.path().join("invalid-utf8-piece-table-saved.txt");
+    let mut bytes = Vec::with_capacity(PIECE_TABLE_MIN_BYTES + 16);
+    bytes.extend_from_slice(&[0x66, 0x6f, 0x80, 0x6f, b'\n']);
+    while bytes.len() < PIECE_TABLE_MIN_BYTES + 16 {
+        bytes.extend_from_slice(b"abc\n");
+    }
+    std::fs::write(&src, &bytes).unwrap();
+
+    let mut doc = Document::open(src.clone()).unwrap();
+    let _ = doc.try_insert_text_at(0, 0, "X").unwrap();
+    assert!(doc.has_piece_table());
+
+    doc.save_to_with_encoding(&saved, DocumentEncoding::utf8())
+        .unwrap();
+
+    assert_eq!(doc.path(), Some(saved.as_path()));
+    assert_eq!(doc.encoding(), DocumentEncoding::utf8());
+    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert!(!doc.decoding_had_errors());
+    assert!(!doc.has_piece_table());
+    assert!(std::fs::read_to_string(&saved).unwrap().starts_with("Xfo\u{FFFD}o\n"));
+}
+
+#[test]
+fn save_to_with_encoding_gb18030_converts_utf8_document() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("converted-gb18030.txt");
+    let encoding = DocumentEncoding::from_label("gb18030").unwrap();
+    let source_text = "\u{4F60}\u{597D}\u{4E16}\u{754C}\n";
+    let mut doc = Document::new();
+    doc.try_insert_text_at(0, 0, source_text).unwrap();
+
+    doc.save_to_with_encoding(&path, encoding).unwrap();
+
+    assert_eq!(doc.encoding(), encoding);
+    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert!(!doc.decoding_had_errors());
+
+    let raw = std::fs::read(&path).unwrap();
+    let (decoded, used, had_errors) = GB18030.decode(&raw);
+    assert_eq!(used, GB18030);
+    assert!(!had_errors);
+    assert_eq!(decoded, source_text);
+}
+
+#[test]
 fn open_with_options_auto_detects_utf16le_bom_and_allows_utf8_convert_save() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("utf16le-source.txt");
@@ -1337,6 +1578,7 @@ fn open_with_options_auto_detects_utf16le_bom_and_allows_utf8_convert_save() {
 
     let mut doc = Document::open_with_auto_encoding_detection(path).unwrap();
     assert_eq!(doc.encoding(), DocumentEncoding::utf16le());
+    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
     assert_eq!(doc.text_lossy(), source_text);
 
     let _ = doc.try_insert_text_at(0, 0, "header\n").unwrap();
@@ -1351,7 +1593,99 @@ fn open_with_options_auto_detects_utf16le_bom_and_allows_utf8_convert_save() {
         "header\nhello\nworld\n"
     );
     assert_eq!(doc.encoding(), DocumentEncoding::utf8());
+    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
     assert!(!doc.decoding_had_errors());
+}
+
+#[test]
+fn open_with_auto_detection_detects_utf16be_bom() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("utf16be-source.txt");
+    let source_text = "hello\nworld\n";
+    let mut bytes = vec![0xFE, 0xFF];
+    for unit in source_text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_be_bytes());
+    }
+    std::fs::write(&path, bytes).unwrap();
+
+    let doc = Document::open_with_auto_encoding_detection(path).unwrap();
+
+    assert_eq!(doc.encoding(), DocumentEncoding::utf16be());
+    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
+    assert_eq!(doc.text_lossy(), source_text);
+}
+
+#[test]
+fn open_options_auto_detection_fallback_exposes_override() {
+    let encoding = DocumentEncoding::from_label("windows-1252").unwrap();
+    let options =
+        DocumentOpenOptions::new().with_auto_encoding_detection_and_fallback(encoding);
+
+    assert_eq!(options.encoding_override(), Some(encoding));
+    assert_eq!(
+        options.encoding_policy(),
+        OpenEncodingPolicy::AutoDetectOrReinterpret(encoding)
+    );
+}
+
+#[test]
+fn open_with_auto_detection_tracks_utf8_fallback_origin() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("utf8-autodetect-fallback.txt");
+    std::fs::write(&path, "hello\nworld\n").unwrap();
+
+    let doc = Document::open_with_auto_encoding_detection(path).unwrap();
+
+    assert_eq!(doc.encoding(), DocumentEncoding::utf8());
+    assert_eq!(
+        doc.encoding_origin(),
+        DocumentEncodingOrigin::AutoDetectFallbackUtf8
+    );
+    assert_eq!(doc.text_lossy(), "hello\nworld\n");
+}
+
+#[test]
+fn open_with_auto_detection_and_fallback_reinterprets_valid_utf8_when_bom_is_missing() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("autodetect-fallback-valid-utf8.txt");
+    let encoding = DocumentEncoding::from_label("windows-1252").unwrap();
+    std::fs::write(&path, "caf\u{00E9}\n".as_bytes()).unwrap();
+
+    let doc = Document::open_with_options(
+        path,
+        DocumentOpenOptions::new().with_auto_encoding_detection_and_fallback(encoding),
+    )
+    .unwrap();
+
+    assert_eq!(doc.encoding(), encoding);
+    assert_eq!(
+        doc.encoding_origin(),
+        DocumentEncodingOrigin::AutoDetectFallbackOverride
+    );
+    assert_eq!(doc.text_lossy(), "caf\u{00C3}\u{00A9}\n");
+    assert_ne!(doc.text_lossy(), "caf\u{00E9}\n");
+}
+
+#[test]
+fn open_with_auto_detection_and_fallback_still_prefers_detected_bom() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("autodetect-fallback-utf16le.txt");
+    let fallback = DocumentEncoding::from_label("windows-1251").unwrap();
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in "hello\n".encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, bytes).unwrap();
+
+    let doc = Document::open_with_options(
+        path,
+        DocumentOpenOptions::new().with_auto_encoding_detection_and_fallback(fallback),
+    )
+    .unwrap();
+
+    assert_eq!(doc.encoding(), DocumentEncoding::utf16le());
+    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
+    assert_eq!(doc.text_lossy(), "hello\n");
 }
 
 #[test]
@@ -1373,7 +1707,7 @@ fn preserve_save_reports_unsupported_contract_for_utf16_source() {
             path: failed_path,
             operation: "save",
             encoding,
-            ..
+            reason: DocumentEncodingErrorKind::PreserveSaveUnsupported,
         } if failed_path == saved && encoding == DocumentEncoding::utf16le()
     ));
 }
@@ -1389,6 +1723,7 @@ fn save_to_with_encoding_converts_utf8_document() {
     doc.save_to_with_encoding(&path, encoding).unwrap();
 
     assert_eq!(doc.encoding(), encoding);
+    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
     assert!(!doc.decoding_had_errors());
     let raw = std::fs::read(&path).unwrap();
     let (decoded, used, had_errors) = WINDOWS_1251.decode(&raw);
@@ -1412,8 +1747,29 @@ fn save_to_with_encoding_rejects_unrepresentable_text() {
             path: failed_path,
             operation: "save",
             encoding: failed_encoding,
-            ..
+            reason: DocumentEncodingErrorKind::UnrepresentableText,
         } if failed_path == path && failed_encoding == encoding
+    ));
+}
+
+#[test]
+fn save_to_with_encoding_rejects_unsupported_target_encoding() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("utf16le-save.txt");
+    let mut doc = Document::new();
+    doc.try_insert_text_at(0, 0, "hello\n").unwrap();
+
+    let err = doc
+        .save_to_with_encoding(&path, DocumentEncoding::utf16le())
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DocumentError::Encoding {
+            path: failed_path,
+            operation: "save",
+            encoding,
+            reason: DocumentEncodingErrorKind::UnsupportedSaveTarget,
+        } if failed_path == path && encoding == DocumentEncoding::utf16le()
     ));
 }
 
@@ -1614,7 +1970,9 @@ fn line_slices_near_tail_read_from_file_end_before_full_index() {
         avg_line_len: Arc::new(AtomicUsize::new(2)),
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
         decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
         rope: None,
         piece_table: None,
         dirty: false,
@@ -1671,7 +2029,9 @@ fn line_slices_bail_out_when_next_line_scan_would_be_unbounded() {
         avg_line_len: Arc::new(AtomicUsize::new(1)),
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
         decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
         rope: None,
         piece_table: None,
         dirty: false,
@@ -1702,7 +2062,9 @@ fn indexing_progress_reports_inflight_state() {
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
         decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
         rope: None,
         piece_table: None,
         dirty: false,
@@ -1738,7 +2100,7 @@ fn save_to_reopens_clean_mmap_documents() {
 }
 
 #[test]
-fn save_to_keeps_large_piece_table_documents_clean_without_reopen() {
+fn save_to_reopens_large_piece_table_documents_clean() {
     let dir = std::env::temp_dir().join(format!("qem-doc-save-piece-table-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let src = dir.join("large.txt");
@@ -1754,9 +2116,102 @@ fn save_to_keeps_large_piece_table_documents_clean_without_reopen() {
 
     assert_eq!(doc.path(), Some(dst.as_path()));
     assert!(!doc.is_dirty());
-    assert!(doc.has_edit_buffer());
+    assert!(!doc.has_edit_buffer());
+    assert_eq!(doc.backing(), DocumentBacking::Mmap);
     assert!(doc.text_lossy().starts_with("123abc\ndef\n"));
     assert!(std::fs::read(&dst).unwrap().starts_with(b"123abc\ndef\n"));
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn piece_table_save_to_rebases_future_recovery_to_saved_path() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-doc-save-piece-table-rebase-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let src = dir.join("large.txt");
+    let dst = dir.join("large-copy.txt");
+    write_disk_backed_fixture(&src);
+
+    {
+        let mut doc = Document::open(src.clone()).unwrap();
+        let _ = doc.try_insert_text_at(0, 0, "123").unwrap();
+        assert!(doc.has_piece_table());
+        doc.save_to(&dst).unwrap();
+
+        let _ = doc.try_insert_text_at(0, 0, "XYZ").unwrap();
+        doc.flush_session().unwrap();
+
+        assert!(
+            !editlog_path(&src).exists(),
+            "future piece-table recovery should stop targeting the old source path after save"
+        );
+        assert!(
+            editlog_path(&dst).exists(),
+            "future piece-table recovery should follow the saved path"
+        );
+    }
+
+    let reopened = Document::open(dst.clone()).unwrap();
+
+    assert!(reopened.is_dirty());
+    assert!(reopened.has_piece_table());
+    assert!(reopened.text_lossy().starts_with("XYZ123abc\ndef\n"));
+
+    clear_session_sidecar(&dst);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn piece_table_save_to_with_encoding_reopens_as_converted_rope_contract() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-doc-save-piece-table-convert-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let src = dir.join("large.txt");
+    let dst = dir.join("large-cp1251.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+    let insert_hello = "\u{043F}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}\n";
+    let insert_world = "\u{043C}\u{0438}\u{0440}\n";
+    write_disk_backed_fixture(&src);
+
+    let mut doc = Document::open(src.clone()).unwrap();
+    let _ = doc.try_insert_text_at(0, 0, insert_hello).unwrap();
+    assert!(doc.has_piece_table());
+
+    doc.save_to_with_encoding(&dst, encoding).unwrap();
+
+    assert_eq!(doc.path(), Some(dst.as_path()));
+    assert_eq!(doc.encoding(), encoding);
+    assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert!(!doc.is_dirty());
+    assert!(!doc.has_piece_table());
+    assert!(doc.has_rope());
+    assert!(doc.text_lossy().starts_with(insert_hello));
+    assert!(!editlog_path(&src).exists());
+    assert!(!editlog_path(&dst).exists());
+
+    let raw = std::fs::read(&dst).unwrap();
+    let (decoded, used, had_errors) = WINDOWS_1251.decode(&raw);
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    assert!(decoded.starts_with(insert_hello));
+
+    let _ = doc.try_insert_text_at(0, 0, insert_world).unwrap();
+    doc.save_to(&dst).unwrap();
+
+    let raw = std::fs::read(&dst).unwrap();
+    let (decoded, used, had_errors) = WINDOWS_1251.decode(&raw);
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    assert!(decoded.starts_with(&format!("{insert_world}{insert_hello}")));
 
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&dst);
@@ -1780,6 +2235,80 @@ fn open_recovers_piece_table_session_from_editlog() {
 
     assert!(recovered.is_dirty());
     assert!(recovered.has_edit_buffer());
+    assert_eq!(
+        recovered.encoding_origin(),
+        DocumentEncodingOrigin::Utf8FastPath
+    );
+    assert!(recovered.text_lossy().starts_with("123abc\ndef\n"));
+
+    clear_session_sidecar(&path);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn recovered_piece_table_session_preserves_utf8_autodetect_origin() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-doc-session-autodetect-origin-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("session.txt");
+    write_disk_backed_fixture(&path);
+
+    {
+        let mut doc = Document::open_with_auto_encoding_detection(path.clone()).unwrap();
+        assert_eq!(
+            doc.encoding_origin(),
+            DocumentEncodingOrigin::AutoDetectFallbackUtf8
+        );
+        let _ = doc.try_insert_text_at(0, 0, "123").unwrap();
+        doc.flush_session().unwrap();
+    }
+
+    let recovered = Document::open(path.clone()).unwrap();
+
+    assert!(recovered.is_dirty());
+    assert!(recovered.has_piece_table());
+    assert_eq!(recovered.encoding(), DocumentEncoding::utf8());
+    assert_eq!(
+        recovered.encoding_origin(),
+        DocumentEncodingOrigin::AutoDetectFallbackUtf8
+    );
+    assert!(!recovered.decoding_had_errors());
+    assert!(recovered.text_lossy().starts_with("123abc\ndef\n"));
+
+    clear_session_sidecar(&path);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn recovered_piece_table_session_preserves_utf8_save_conversion_origin() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-doc-session-save-conversion-origin-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("session.txt");
+    write_disk_backed_fixture(&path);
+
+    {
+        let mut doc = Document::open(path.clone()).unwrap();
+        doc.save_to_with_encoding(&path, DocumentEncoding::utf8())
+            .unwrap();
+        assert_eq!(doc.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+        let _ = doc.try_insert_text_at(0, 0, "123").unwrap();
+        doc.flush_session().unwrap();
+    }
+
+    let recovered = Document::open(path.clone()).unwrap();
+
+    assert!(recovered.is_dirty());
+    assert!(recovered.has_piece_table());
+    assert_eq!(recovered.encoding(), DocumentEncoding::utf8());
+    assert_eq!(recovered.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert!(!recovered.decoding_had_errors());
     assert!(recovered.text_lossy().starts_with("123abc\ndef\n"));
 
     clear_session_sidecar(&path);
@@ -2058,7 +2587,9 @@ fn try_insert_rejects_large_piece_table_promotion_to_rope() {
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
         decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
         rope: None,
         piece_table: Some(PieceTable {
             original: storage,
@@ -2073,6 +2604,8 @@ fn try_insert_rejects_large_piece_table_promotion_to_rope() {
             known_byte_len: 1,
             total_len: MAX_ROPE_EDIT_FILE_BYTES + 1,
             full_index: false,
+            encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+            decoding_had_errors: false,
             pending_session_flush: false,
             pending_session_edits: 0,
             last_session_flush: None,
@@ -2736,10 +3269,138 @@ fn document_status_reports_frontend_snapshot() {
     assert_eq!(status.display_line_count(), 2);
     assert!(status.is_line_count_exact());
     assert_eq!(status.line_ending(), LineEnding::Lf);
+    assert_eq!(status.encoding_origin(), DocumentEncodingOrigin::NewDocument);
+    assert!(status.can_preserve_save());
+    assert_eq!(status.preserve_save_error(), None);
     assert!(status.has_edit_buffer());
     assert!(status.has_rope());
     assert!(!status.has_piece_table());
     assert!(!status.is_indexing());
+}
+
+#[test]
+fn preserve_save_preflight_reports_lossy_and_unsupported_contracts() {
+    let dir = tempdir().unwrap();
+    let lossy_path = dir.path().join("lossy-shift-jis.txt");
+    let utf16_path = dir.path().join("utf16le-source.txt");
+    std::fs::write(&lossy_path, [0x82]).unwrap();
+
+    let lossy_encoding = DocumentEncoding::from_label("shift_jis").unwrap();
+    let lossy_doc = Document::open_with_encoding(lossy_path, lossy_encoding).unwrap();
+    assert!(!lossy_doc.can_preserve_save());
+    assert_eq!(
+        lossy_doc.preserve_save_error(),
+        Some(DocumentEncodingErrorKind::LossyDecodedPreserve)
+    );
+    assert_eq!(
+        lossy_doc.status().preserve_save_error(),
+        Some(DocumentEncodingErrorKind::LossyDecodedPreserve)
+    );
+
+    let mut utf16_bytes = vec![0xFF, 0xFE];
+    for unit in "hello\n".encode_utf16() {
+        utf16_bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&utf16_path, utf16_bytes).unwrap();
+
+    let utf16_doc = Document::open_with_auto_encoding_detection(utf16_path).unwrap();
+    assert!(!utf16_doc.can_preserve_save());
+    assert_eq!(
+        utf16_doc.preserve_save_error(),
+        Some(DocumentEncodingErrorKind::PreserveSaveUnsupported)
+    );
+    assert_eq!(
+        utf16_doc.status().preserve_save_error(),
+        Some(DocumentEncodingErrorKind::PreserveSaveUnsupported)
+    );
+}
+
+#[test]
+fn save_conversion_preflight_reports_success_and_failures() {
+    let cp1251 = DocumentEncoding::from_label("windows-1251").unwrap();
+
+    let mut representable = Document::new();
+    representable
+        .try_insert_text_at(0, 0, "\u{043F}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}\n")
+        .unwrap();
+    assert_eq!(representable.save_error_for_encoding(cp1251), None);
+    assert!(representable.can_save_with_encoding(cp1251));
+
+    let mut unrepresentable = Document::new();
+    unrepresentable
+        .try_insert_text_at(0, 0, "emoji \u{1F642}\n")
+        .unwrap();
+    assert_eq!(
+        unrepresentable.save_error_for_encoding(cp1251),
+        Some(DocumentEncodingErrorKind::UnrepresentableText)
+    );
+    assert!(!unrepresentable.can_save_with_encoding(cp1251));
+    assert_eq!(
+        unrepresentable.save_error_for_options(
+            DocumentSaveOptions::new().with_encoding(DocumentEncoding::utf16le())
+        ),
+        Some(DocumentEncodingErrorKind::UnsupportedSaveTarget)
+    );
+}
+
+#[test]
+fn lossy_document_save_conversion_preflight_allows_utf8_salvage() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("lossy-shift-jis-preflight.txt");
+    let shift_jis = DocumentEncoding::from_label("shift_jis").unwrap();
+    std::fs::write(&path, [0x82]).unwrap();
+
+    let doc = Document::open_with_encoding(path, shift_jis).unwrap();
+
+    assert_eq!(
+        doc.save_error_for_encoding(DocumentEncoding::utf8()),
+        None
+    );
+    assert!(doc.can_save_with_encoding(DocumentEncoding::utf8()));
+    assert_eq!(
+        doc.save_error_for_encoding(shift_jis),
+        Some(DocumentEncodingErrorKind::UnrepresentableText)
+    );
+}
+
+#[test]
+fn preserve_save_preflight_reports_unrepresentable_legacy_edits() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy-cp1251-preflight.txt");
+    let saved = dir.path().join("legacy-cp1251-preflight-saved.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+    let (bytes, used, had_errors) = WINDOWS_1251.encode("\u{043F}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}\n");
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    std::fs::write(&path, bytes.as_ref()).unwrap();
+
+    let mut doc = Document::open_with_encoding(path, encoding).unwrap();
+    let _ = doc.try_insert_text_at(0, 0, "emoji \u{1F642}\n").unwrap();
+
+    assert_eq!(
+        doc.preserve_save_error(),
+        Some(DocumentEncodingErrorKind::UnrepresentableText)
+    );
+    assert!(!doc.can_preserve_save());
+    assert_eq!(
+        doc.save_error_for_options(DocumentSaveOptions::new()),
+        Some(DocumentEncodingErrorKind::UnrepresentableText)
+    );
+    assert_eq!(
+        doc.status().preserve_save_error(),
+        Some(DocumentEncodingErrorKind::UnrepresentableText)
+    );
+
+    let err = doc.save_to(&saved).unwrap_err();
+    assert!(matches!(
+        err,
+        DocumentError::Encoding {
+            path: failed_path,
+            operation: "save",
+            encoding: failed_encoding,
+            reason: DocumentEncodingErrorKind::UnrepresentableText,
+        } if failed_path == saved && failed_encoding == encoding
+    ));
 }
 
 #[test]
@@ -2891,7 +3552,9 @@ fn edit_capability_reports_partial_piece_table_promotion_limits() {
         avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
         line_ending: LineEnding::Lf,
         encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
         decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
         rope: None,
         piece_table: Some(PieceTable {
             original: storage,
@@ -2906,6 +3569,8 @@ fn edit_capability_reports_partial_piece_table_promotion_limits() {
             known_byte_len: 1,
             total_len: MAX_ROPE_EDIT_FILE_BYTES + 1,
             full_index: false,
+            encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+            decoding_had_errors: false,
             pending_session_flush: false,
             pending_session_edits: 0,
             last_session_flush: None,
@@ -3095,7 +3760,8 @@ proptest! {
 
             assert_eq!(doc.path(), Some(saved.as_path()));
             assert!(!doc.is_dirty());
-            assert!(doc.has_edit_buffer());
+            assert!(!doc.has_edit_buffer());
+            assert_eq!(doc.backing(), DocumentBacking::Mmap);
             assert_eq!(doc.text_lossy(), expected);
             assert_eq!(std::fs::read_to_string(&saved).unwrap(), expected);
             assert_eq!(std::fs::read_to_string(&source).unwrap(), original);

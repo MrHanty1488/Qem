@@ -1,4 +1,5 @@
 use super::*;
+use crate::DocumentEncodingErrorKind;
 use std::sync::Arc;
 
 /// Cursor position in document coordinates, using 1-based indexing.
@@ -355,6 +356,31 @@ impl DocumentSessionStatus {
         self.document.line_ending()
     }
 
+    /// Returns the current document encoding contract.
+    pub fn encoding(&self) -> DocumentEncoding {
+        self.document.encoding()
+    }
+
+    /// Returns the typed reason why preserve-save would currently fail, if any.
+    pub fn preserve_save_error(&self) -> Option<DocumentEncodingErrorKind> {
+        self.document.preserve_save_error()
+    }
+
+    /// Returns `true` when preserve-save is currently allowed for this snapshot.
+    pub fn can_preserve_save(&self) -> bool {
+        self.document.can_preserve_save()
+    }
+
+    /// Returns how the current encoding contract was chosen.
+    pub fn encoding_origin(&self) -> DocumentEncodingOrigin {
+        self.document.encoding_origin()
+    }
+
+    /// Returns `true` when opening the source required lossy decode replacement.
+    pub fn decoding_had_errors(&self) -> bool {
+        self.document.decoding_had_errors()
+    }
+
     /// Returns the current document backing mode.
     pub fn backing(&self) -> DocumentBacking {
         self.document.backing()
@@ -515,6 +541,31 @@ impl EditorTabStatus {
     /// Returns the currently detected line ending style.
     pub fn line_ending(&self) -> LineEnding {
         self.session.line_ending()
+    }
+
+    /// Returns the current document encoding contract.
+    pub fn encoding(&self) -> DocumentEncoding {
+        self.session.encoding()
+    }
+
+    /// Returns the typed reason why preserve-save would currently fail, if any.
+    pub fn preserve_save_error(&self) -> Option<DocumentEncodingErrorKind> {
+        self.session.preserve_save_error()
+    }
+
+    /// Returns `true` when preserve-save is currently allowed for this snapshot.
+    pub fn can_preserve_save(&self) -> bool {
+        self.session.can_preserve_save()
+    }
+
+    /// Returns how the current encoding contract was chosen.
+    pub fn encoding_origin(&self) -> DocumentEncodingOrigin {
+        self.session.encoding_origin()
+    }
+
+    /// Returns `true` when opening the source required lossy decode replacement.
+    pub fn decoding_had_errors(&self) -> bool {
+        self.session.decoding_had_errors()
     }
 
     /// Returns the current document backing mode.

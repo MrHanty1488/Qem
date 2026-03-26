@@ -59,13 +59,13 @@ fn open_encoding_error(
     path: &Path,
     operation: &'static str,
     encoding: DocumentEncoding,
-    message: impl Into<String>,
+    reason: DocumentEncodingErrorKind,
 ) -> DocumentError {
     DocumentError::Encoding {
         path: path.to_path_buf(),
         operation,
         encoding,
-        message: message.into(),
+        reason,
     }
 }
 
@@ -104,7 +104,9 @@ impl Document {
             avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
             line_ending: LineEnding::Lf,
             encoding: DocumentEncoding::utf8(),
+            encoding_origin: DocumentEncodingOrigin::NewDocument,
             decoding_had_errors: false,
+            preserve_save_error_cache: Cell::new(None),
             rope: None,
             piece_table: None,
             dirty: false,
@@ -221,44 +223,123 @@ impl Document {
 
         let mut tracker = OpenProgressTracker::new(storage.len() as u64, progress);
         let bytes = storage.bytes();
-        let encoding = match encoding_policy {
-            OpenEncodingPolicy::Utf8FastPath => None,
+        let (encoding, encoding_origin) = match encoding_policy {
+            OpenEncodingPolicy::Utf8FastPath => (None, DocumentEncodingOrigin::Utf8FastPath),
             OpenEncodingPolicy::AutoDetect => {
                 let inspected = bytes.len().min(2);
                 if inspected > 0 {
                     tracker.report_inspected(inspected);
                 }
-                auto_detect_open_encoding(bytes)
+                match auto_detect_open_encoding(bytes) {
+                    Some(encoding) => (Some(encoding), DocumentEncodingOrigin::AutoDetected),
+                    None => (None, DocumentEncodingOrigin::AutoDetectFallbackUtf8),
+                }
             }
-            OpenEncodingPolicy::Reinterpret(encoding) => Some(encoding),
+            OpenEncodingPolicy::AutoDetectOrReinterpret(fallback_encoding) => {
+                let inspected = bytes.len().min(2);
+                if inspected > 0 {
+                    tracker.report_inspected(inspected);
+                }
+                match auto_detect_open_encoding(bytes) {
+                    Some(encoding) => (Some(encoding), DocumentEncodingOrigin::AutoDetected),
+                    None => (
+                        Some(fallback_encoding),
+                        DocumentEncodingOrigin::AutoDetectFallbackOverride,
+                    ),
+                }
+            }
+            OpenEncodingPolicy::Reinterpret(encoding) => {
+                (Some(encoding), DocumentEncodingOrigin::ExplicitReinterpretation)
+            }
         };
         let doc = if let Some(encoding) = encoding {
-            Self::from_storage_with_encoding(path, storage, encoding, &mut tracker, phase)?
+            Self::from_storage_with_encoding(
+                path,
+                storage,
+                encoding,
+                encoding_origin,
+                &mut tracker,
+                phase,
+            )?
         } else {
-            Self::from_storage_with_progress(path, storage, &mut tracker, phase)
+            Self::from_storage_with_progress(
+                path,
+                storage,
+                encoding_origin,
+                &mut tracker,
+                phase,
+            )
         };
         phase(OpenProgressPhase::Ready);
         tracker.complete();
         Ok(doc)
     }
 
-    pub(super) fn from_storage(path: PathBuf, storage: FileStorage) -> Self {
+    pub(super) fn from_storage_with_origin(
+        path: PathBuf,
+        storage: FileStorage,
+        encoding_origin: DocumentEncodingOrigin,
+    ) -> Self {
         let total_bytes = storage.len() as u64;
         let mut progress = ignore_open_progress as fn(u64);
         let mut tracker = OpenProgressTracker::new(total_bytes, &mut progress);
-        Self::from_storage_with_progress(path, storage, &mut tracker, &mut ignore_open_phase)
+        Self::from_storage_with_progress(
+            path,
+            storage,
+            encoding_origin,
+            &mut tracker,
+            &mut ignore_open_phase,
+        )
+    }
+
+    pub(super) fn reopen_with_encoding_contract(
+        path: PathBuf,
+        encoding: DocumentEncoding,
+        encoding_origin: DocumentEncodingOrigin,
+    ) -> Result<Self, DocumentError> {
+        let storage = FileStorage::open(&path).map_err(|err| match err {
+            StorageOpenError::Open(source) => DocumentError::Open {
+                path: path.clone(),
+                source,
+            },
+            StorageOpenError::Map(source) => DocumentError::Map {
+                path: path.clone(),
+                source,
+            },
+        })?;
+
+        if encoding.is_utf8() {
+            return Ok(Self::from_storage_with_origin(path, storage, encoding_origin));
+        }
+
+        let total_bytes = storage.len() as u64;
+        let mut progress = ignore_open_progress as fn(u64);
+        let mut tracker = OpenProgressTracker::new(total_bytes, &mut progress);
+        Self::from_storage_with_encoding(
+            path,
+            storage,
+            encoding,
+            encoding_origin,
+            &mut tracker,
+            &mut ignore_open_phase,
+        )
     }
 
     fn from_storage_with_encoding(
         path: PathBuf,
         storage: FileStorage,
         encoding: DocumentEncoding,
+        encoding_origin: DocumentEncodingOrigin,
         progress: &mut OpenProgressTracker<'_>,
         phase: &mut dyn FnMut(OpenProgressPhase),
     ) -> Result<Self, DocumentError> {
         if encoding.is_utf8() {
             return Ok(Self::from_storage_with_progress(
-                path, storage, progress, phase,
+                path,
+                storage,
+                encoding_origin,
+                progress,
+                phase,
             ));
         }
         if storage.len() > MAX_ROPE_EDIT_FILE_BYTES {
@@ -266,10 +347,9 @@ impl Document {
                 &path,
                 "open",
                 encoding,
-                format!(
-                    "non-UTF8 open currently requires full transcoding and is limited to {} bytes",
-                    MAX_ROPE_EDIT_FILE_BYTES
-                ),
+                DocumentEncodingErrorKind::OpenTranscodeTooLarge {
+                    max_bytes: MAX_ROPE_EDIT_FILE_BYTES,
+                },
             ));
         }
 
@@ -297,7 +377,9 @@ impl Document {
             avg_line_len,
             line_ending,
             encoding,
+            encoding_origin,
             decoding_had_errors,
+            preserve_save_error_cache: Cell::new(None),
             rope: Some(rope),
             piece_table: None,
             dirty: false,
@@ -307,6 +389,7 @@ impl Document {
     fn from_storage_with_progress(
         path: PathBuf,
         storage: FileStorage,
+        encoding_origin: DocumentEncodingOrigin,
         progress: &mut OpenProgressTracker<'_>,
         phase: &mut dyn FnMut(OpenProgressPhase),
     ) -> Self {
@@ -368,7 +451,9 @@ impl Document {
                         avg_line_len,
                         line_ending,
                         encoding: DocumentEncoding::utf8(),
-                        decoding_had_errors: false,
+                        encoding_origin: meta.encoding_origin.unwrap_or(encoding_origin),
+                        decoding_had_errors: meta.decoding_had_errors,
+                        preserve_save_error_cache: Cell::new(None),
                         rope: None,
                         piece_table: Some(PieceTable::from_recovered_session(
                             storage, add, pieces, meta,
@@ -400,7 +485,9 @@ impl Document {
                 avg_line_len,
                 line_ending,
                 encoding: DocumentEncoding::utf8(),
+                encoding_origin,
                 decoding_had_errors: false,
+                preserve_save_error_cache: Cell::new(None),
                 rope: Some(Rope::new()),
                 piece_table: None,
                 dirty: false,
@@ -423,7 +510,9 @@ impl Document {
                 avg_line_len,
                 line_ending,
                 encoding: DocumentEncoding::utf8(),
-                decoding_had_errors: false,
+                encoding_origin,
+                decoding_had_errors: inline_analysis.utf8_had_errors,
+                preserve_save_error_cache: Cell::new(None),
                 rope: None,
                 piece_table: None,
                 dirty: false,
@@ -613,7 +702,9 @@ impl Document {
             avg_line_len,
             line_ending,
             encoding: DocumentEncoding::utf8(),
+            encoding_origin,
             decoding_had_errors: false,
+            preserve_save_error_cache: Cell::new(None),
             rope: None,
             piece_table: None,
             dirty: false,
@@ -637,6 +728,7 @@ impl Document {
 
     /// Clears the unsaved-changes flag.
     pub fn mark_clean(&mut self) {
+        self.invalidate_preserve_save_error_cache();
         self.dirty = false;
     }
 

@@ -184,14 +184,26 @@
 //!   [`DocumentOpenOptions`], [`OpenEncodingPolicy`], and
 //!   [`DocumentSaveOptions`].
 //! - Auto-detect open currently recognizes BOM-backed UTF-16 files and
-//!   otherwise keeps the normal UTF-8/ASCII fast path. Legacy encodings without
-//!   a BOM still require an explicit reinterpretation encoding.
+//!   otherwise keeps the normal UTF-8/ASCII fast path. Callers that already
+//!   know a likely legacy fallback can opt into "detect first, otherwise
+//!   reinterpret as X" through [`DocumentOpenOptions`] and the session/tab
+//!   convenience wrappers.
 //! - Non-UTF8 opens currently materialize into a rope-backed document instead
 //!   of using the mmap fast path. Very large legacy-encoded files may therefore
 //!   still be rejected until the broader encoding contract lands in a later
 //!   release.
 //! - Preserve-save for some decoded encodings can still return a typed
-//!   [`DocumentError::Encoding`] until a broader persistence contract lands.
+//!   [`DocumentError::Encoding`] with a structured
+//!   [`DocumentEncodingErrorKind`] until a broader persistence contract lands.
+//!   [`Document::decoding_had_errors`] means Qem has already seen malformed
+//!   source bytes, but preserve-save is only rejected when the write would
+//!   materialize lossy-decoded text. Raw mmap/piece-table preserve can still
+//!   remain valid, while rope-backed legacy opens and UTF-8 after lossy
+//!   materialization/edit correctly fail with
+//!   [`DocumentEncodingErrorKind::LossyDecodedPreserve`]. Frontends can
+//!   preflight both preserve and explicit conversion paths through
+//!   [`Document::preserve_save_error`], [`Document::save_error_for_options`],
+//!   and the matching session/tab wrappers before attempting the write.
 //!   Callers can already convert to a supported target through
 //!   [`DocumentSaveOptions`] or [`Document::save_to_with_encoding`].
 //! - Huge files are supported for mmap-backed reads, viewport rendering, line
@@ -231,9 +243,10 @@ pub mod storage;
 
 pub use document::{
     ByteProgress, CompactionPolicy, CompactionRecommendation, CompactionUrgency, CutResult,
-    Document, DocumentBacking, DocumentEncoding, DocumentError, DocumentMaintenanceStatus,
-    DocumentOpenOptions, DocumentSaveOptions, DocumentStatus, EditCapability, EditResult,
-    FragmentationStats, IdleCompactionOutcome, LineCount, LineEnding, LineSlice, LiteralSearchIter,
+    Document, DocumentBacking, DocumentEncoding, DocumentEncodingErrorKind,
+    DocumentEncodingOrigin, DocumentError, DocumentMaintenanceStatus, DocumentOpenOptions,
+    DocumentSaveOptions, DocumentStatus, EditCapability, EditResult, FragmentationStats,
+    IdleCompactionOutcome, LineCount, LineEnding, LineSlice, LiteralSearchIter,
     LiteralSearchQuery, MaintenanceAction, OpenEncodingPolicy, SaveEncodingPolicy, SearchMatch,
     TextPosition, TextRange, TextSelection, TextSlice, Viewport, ViewportRequest, ViewportRow,
 };

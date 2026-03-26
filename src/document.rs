@@ -1,5 +1,6 @@
 use memchr::{memchr2, memchr2_iter};
 use ropey::{Rope, RopeBuilder};
+use std::cell::Cell;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -32,11 +33,11 @@ pub(crate) use lifecycle::OpenProgressPhase;
 pub(crate) use persistence::{PreparedSave, SaveCompletion};
 pub use search::{LiteralSearchIter, LiteralSearchQuery};
 pub use types::{
-    ByteProgress, CutResult, DocumentBacking, DocumentEncoding, DocumentError,
-    DocumentMaintenanceStatus, DocumentOpenOptions, DocumentSaveOptions, DocumentStatus,
-    EditCapability, EditResult, LineCount, LineSlice, MaintenanceAction, OpenEncodingPolicy,
-    SaveEncodingPolicy, SearchMatch, TextPosition, TextRange, TextSelection, TextSlice, Viewport,
-    ViewportRequest, ViewportRow,
+    ByteProgress, CutResult, DocumentBacking, DocumentEncoding, DocumentEncodingErrorKind,
+    DocumentEncodingOrigin, DocumentError, DocumentMaintenanceStatus, DocumentOpenOptions,
+    DocumentSaveOptions, DocumentStatus, EditCapability, EditResult, LineCount, LineSlice,
+    MaintenanceAction, OpenEncodingPolicy, SaveEncodingPolicy, SearchMatch, TextPosition,
+    TextRange, TextSelection, TextSlice, Viewport, ViewportRequest, ViewportRow,
 };
 
 // Hard limits to keep mmap indexing bounded for huge files.
@@ -158,9 +159,9 @@ fn normalize_insert_text(
     (normalized, added_lines, last_col)
 }
 
-fn build_rope_from_bytes(bytes: &[u8]) -> Rope {
+fn build_rope_from_bytes(bytes: &[u8]) -> (Rope, bool) {
     if bytes.is_empty() {
-        return Rope::new();
+        return (Rope::new(), false);
     }
 
     let mut builder = RopeBuilder::new();
@@ -168,10 +169,13 @@ fn build_rope_from_bytes(bytes: &[u8]) -> Rope {
     let mut input = bytes;
     let mut out = [0u8; 8192];
     let mut prev_was_cr = false;
+    let mut had_errors = false;
 
     loop {
         let last = input.is_empty();
-        let (result, read, written, _) = decoder.decode_to_utf8(input, &mut out, last);
+        let (result, read, written, chunk_had_errors) =
+            decoder.decode_to_utf8(input, &mut out, last);
+        had_errors |= chunk_had_errors;
         if written > 0 {
             if let Ok(s) = std::str::from_utf8(&out[..written]) {
                 if !s.is_empty() {
@@ -207,7 +211,7 @@ fn build_rope_from_bytes(bytes: &[u8]) -> Rope {
         }
     }
 
-    builder.finish()
+    (builder.finish(), had_errors)
 }
 
 fn normalize_decoded_text(text: &str) -> String {
@@ -272,17 +276,19 @@ fn decode_text_with_encoding(bytes: &[u8], encoding: DocumentEncoding) -> (Strin
 fn encode_text_with_encoding(
     text: &str,
     encoding: DocumentEncoding,
-) -> Result<Vec<u8>, &'static str> {
+) -> Result<Vec<u8>, DocumentEncodingErrorKind> {
     if !encoding.can_roundtrip_save() {
-        return Err("this encoding is not yet supported as a save target");
+        return Err(DocumentEncodingErrorKind::UnsupportedSaveTarget);
     }
 
     let (encoded, output_encoding, had_errors) = encoding.as_encoding().encode(text);
     if output_encoding != encoding.as_encoding() {
-        return Err("encoding_rs redirected this save target to a different encoding");
+        return Err(DocumentEncodingErrorKind::RedirectedSaveTarget {
+            actual: DocumentEncoding::from_encoding_rs(output_encoding),
+        });
     }
     if had_errors {
-        return Err("the current document contains characters that are not representable in the target encoding");
+        return Err(DocumentEncodingErrorKind::UnrepresentableText);
     }
     Ok(encoded.into_owned())
 }
@@ -500,6 +506,7 @@ struct InlineOpenAnalysis {
     line_offsets: LineOffsets,
     line_ending: LineEnding,
     avg_line_len: usize,
+    utf8_had_errors: bool,
 }
 
 fn analyze_inline_open(bytes: &[u8]) -> InlineOpenAnalysis {
@@ -540,6 +547,7 @@ fn analyze_inline_open(bytes: &[u8]) -> InlineOpenAnalysis {
             line_offsets: LineOffsets::U32(offsets),
             line_ending: detected_line_ending.unwrap_or(LineEnding::Lf),
             avg_line_len: avg_line_len(line_breaks),
+            utf8_had_errors: std::str::from_utf8(bytes).is_err(),
         };
     }
 
@@ -568,6 +576,7 @@ fn analyze_inline_open(bytes: &[u8]) -> InlineOpenAnalysis {
         line_offsets: LineOffsets::U64(offsets),
         line_ending: detected_line_ending.unwrap_or(LineEnding::Lf),
         avg_line_len: avg_line_len(line_breaks),
+        utf8_had_errors: std::str::from_utf8(bytes).is_err(),
     }
 }
 
@@ -917,7 +926,9 @@ pub struct Document {
     avg_line_len: Arc<AtomicUsize>,
     line_ending: LineEnding,
     encoding: DocumentEncoding,
+    encoding_origin: DocumentEncodingOrigin,
     decoding_had_errors: bool,
+    preserve_save_error_cache: Cell<Option<Option<DocumentEncodingErrorKind>>>,
 
     // Mutable text storage. When present, it becomes the source of truth for rendering/editing.
     rope: Option<Rope>,
@@ -934,6 +945,8 @@ pub(crate) struct PieceTable {
     known_byte_len: usize,
     total_len: usize,
     full_index: bool,
+    encoding_origin: DocumentEncodingOrigin,
+    decoding_had_errors: bool,
     pending_session_flush: bool,
     pending_session_edits: usize,
     last_session_flush: Option<Instant>,
@@ -1040,7 +1053,24 @@ impl PieceTableLineSliceCollector {
 }
 
 impl PieceTable {
-    fn new(original: FileStorage, mut line_lengths: Vec<usize>, full_index: bool) -> Self {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn new(original: FileStorage, line_lengths: Vec<usize>, full_index: bool) -> Self {
+        Self::new_with_encoding_state(
+            original,
+            line_lengths,
+            full_index,
+            DocumentEncodingOrigin::Utf8FastPath,
+            false,
+        )
+    }
+
+    fn new_with_encoding_state(
+        original: FileStorage,
+        mut line_lengths: Vec<usize>,
+        full_index: bool,
+        encoding_origin: DocumentEncodingOrigin,
+        decoding_had_errors: bool,
+    ) -> Self {
         let total_len = original.len();
         if line_lengths.is_empty() {
             line_lengths.push(total_len);
@@ -1058,6 +1088,8 @@ impl PieceTable {
             known_byte_len,
             total_len,
             full_index,
+            encoding_origin,
+            decoding_had_errors,
             pending_session_flush: false,
             pending_session_edits: 0,
             last_session_flush: None,
@@ -1084,6 +1116,10 @@ impl PieceTable {
             known_byte_len,
             total_len,
             full_index: meta.full_index,
+            encoding_origin: meta
+                .encoding_origin
+                .unwrap_or(DocumentEncodingOrigin::Utf8FastPath),
+            decoding_had_errors: meta.decoding_had_errors,
             pending_session_flush: false,
             pending_session_edits: 0,
             last_session_flush: None,
@@ -1120,6 +1156,8 @@ impl PieceTable {
         SessionMeta {
             known_byte_len: self.known_byte_len,
             full_index: self.full_index,
+            encoding_origin: Some(self.encoding_origin),
+            decoding_had_errors: self.decoding_had_errors,
         }
     }
 

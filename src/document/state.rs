@@ -320,10 +320,21 @@ impl Document {
             self.line_count(),
             self.line_ending(),
             self.encoding(),
+            self.preserve_save_error(),
+            self.encoding_origin(),
             self.decoding_had_errors(),
             self.indexing_state(),
             self.backing(),
         )
+    }
+
+    pub(super) fn invalidate_preserve_save_error_cache(&self) {
+        self.preserve_save_error_cache.set(None);
+    }
+
+    pub(super) fn mark_dirty(&mut self) {
+        self.invalidate_preserve_save_error_cache();
+        self.dirty = true;
     }
 
     /// Returns a maintenance-focused snapshot using the default compaction policy.
@@ -383,6 +394,86 @@ impl Document {
     /// Returns the current explicit or inherited encoding contract for the document.
     pub fn encoding(&self) -> DocumentEncoding {
         self.encoding
+    }
+
+    pub(super) fn preserve_save_materializes_lossy_decoded_text(&self) -> bool {
+        self.decoding_had_errors && !(self.encoding.is_utf8() && self.rope.is_none())
+    }
+
+    fn rendered_text_for_save_validation(&self) -> String {
+        if let Some(rope) = &self.rope {
+            return rope_text_with_line_endings(rope, self.line_ending);
+        }
+        if let Some(piece_table) = &self.piece_table {
+            return piece_table.to_string_lossy();
+        }
+        String::from_utf8_lossy(self.mmap_bytes()).to_string()
+    }
+
+    /// Returns the typed reason why preserve-save would currently fail, if any.
+    pub fn preserve_save_error(&self) -> Option<DocumentEncodingErrorKind> {
+        if let Some(cached) = self.preserve_save_error_cache.get() {
+            return cached;
+        }
+
+        let computed = if !self.encoding.can_roundtrip_save() {
+            Some(DocumentEncodingErrorKind::PreserveSaveUnsupported)
+        } else if self.preserve_save_materializes_lossy_decoded_text() {
+            Some(DocumentEncodingErrorKind::LossyDecodedPreserve)
+        } else if self.encoding.is_utf8() {
+            None
+        } else {
+            let rendered = self.rendered_text_for_save_validation();
+            encode_text_with_encoding(&rendered, self.encoding).err()
+        };
+
+        self.preserve_save_error_cache.set(Some(computed));
+        computed
+    }
+
+    /// Returns `true` when preserve-save is currently allowed for this document.
+    pub fn can_preserve_save(&self) -> bool {
+        self.preserve_save_error().is_none()
+    }
+
+    /// Returns the typed reason why the requested save options would currently fail, if any.
+    ///
+    /// For explicit save conversions this may materialize the current document
+    /// text to validate representability in the target encoding.
+    pub fn save_error_for_options(
+        &self,
+        options: DocumentSaveOptions,
+    ) -> Option<DocumentEncodingErrorKind> {
+        match options.encoding_policy() {
+            SaveEncodingPolicy::Preserve => self.preserve_save_error(),
+            SaveEncodingPolicy::Convert(encoding) => {
+                let rendered = self.rendered_text_for_save_validation();
+                encode_text_with_encoding(&rendered, encoding).err()
+            }
+        }
+    }
+
+    /// Returns `true` when the requested save options are currently valid.
+    pub fn can_save_with_options(&self, options: DocumentSaveOptions) -> bool {
+        self.save_error_for_options(options).is_none()
+    }
+
+    /// Returns the typed reason why an explicit save conversion would currently fail, if any.
+    pub fn save_error_for_encoding(
+        &self,
+        encoding: DocumentEncoding,
+    ) -> Option<DocumentEncodingErrorKind> {
+        self.save_error_for_options(DocumentSaveOptions::new().with_encoding(encoding))
+    }
+
+    /// Returns `true` when saving through the given explicit encoding is currently valid.
+    pub fn can_save_with_encoding(&self, encoding: DocumentEncoding) -> bool {
+        self.save_error_for_encoding(encoding).is_none()
+    }
+
+    /// Returns how the current encoding contract was chosen.
+    pub fn encoding_origin(&self) -> DocumentEncodingOrigin {
+        self.encoding_origin
     }
 
     /// Returns `true` when opening the source required replacement characters.

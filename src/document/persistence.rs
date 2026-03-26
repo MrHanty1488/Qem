@@ -62,6 +62,7 @@ pub(crate) struct PreparedSave {
     total_bytes: u64,
     reload_after_save: bool,
     encoding: DocumentEncoding,
+    encoding_origin: DocumentEncodingOrigin,
     snapshot: SaveSnapshot,
 }
 
@@ -70,6 +71,7 @@ pub(crate) struct SaveCompletion {
     pub path: PathBuf,
     pub reload_after_save: bool,
     pub encoding: DocumentEncoding,
+    pub encoding_origin: DocumentEncodingOrigin,
 }
 
 impl PreparedSave {
@@ -96,6 +98,7 @@ impl PreparedSave {
             path,
             reload_after_save: self.reload_after_save,
             encoding: self.encoding,
+            encoding_origin: self.encoding_origin,
         })
     }
 }
@@ -185,13 +188,13 @@ fn save_encoding_error(
     path: &Path,
     operation: &'static str,
     encoding: DocumentEncoding,
-    message: impl Into<String>,
+    reason: DocumentEncodingErrorKind,
 ) -> DocumentError {
     DocumentError::Encoding {
         path: path.to_path_buf(),
         operation,
         encoding,
-        message: message.into(),
+        reason,
     }
 }
 
@@ -218,7 +221,7 @@ impl Document {
     ) -> Result<Vec<u8>, DocumentError> {
         let rendered = self.rendered_text_for_save();
         encode_text_with_encoding(&rendered, encoding)
-            .map_err(|message| save_encoding_error(path, "save", encoding, message))
+            .map_err(|reason| save_encoding_error(path, "save", encoding, reason))
     }
 
     /// Forces the current sidecar session state to disk.
@@ -255,11 +258,11 @@ impl Document {
         match piece_table.undo() {
             Ok(false) => Ok(false),
             Ok(true) => {
-                self.dirty = true;
+                self.mark_dirty();
                 Ok(true)
             }
             Err(source) => {
-                self.dirty = true;
+                self.mark_dirty();
                 Err(DocumentError::Write { path, source })
             }
         }
@@ -282,11 +285,11 @@ impl Document {
         match piece_table.redo() {
             Ok(false) => Ok(false),
             Ok(true) => {
-                self.dirty = true;
+                self.mark_dirty();
                 Ok(true)
             }
             Err(source) => {
-                self.dirty = true;
+                self.mark_dirty();
                 Err(DocumentError::Write { path, source })
             }
         }
@@ -343,34 +346,52 @@ impl Document {
         options: DocumentSaveOptions,
         compaction_policy: Option<CompactionPolicy>,
     ) -> Result<PreparedSave, DocumentError> {
-        let encoding = match options.encoding_policy() {
+        let (encoding, encoding_origin, explicit_conversion) = match options.encoding_policy() {
             SaveEncodingPolicy::Preserve => {
                 if !self.encoding.can_roundtrip_save() {
                     return Err(save_encoding_error(
                         path,
                         "save",
                         self.encoding,
-                        "preserve-save is not yet supported for this encoding; use DocumentSaveOptions::with_encoding(...) to convert to a supported target",
+                        DocumentEncodingErrorKind::PreserveSaveUnsupported,
                     ));
                 }
-                self.encoding
+                if self.preserve_save_materializes_lossy_decoded_text() {
+                    return Err(save_encoding_error(
+                        path,
+                        "save",
+                        self.encoding,
+                        DocumentEncodingErrorKind::LossyDecodedPreserve,
+                    ));
+                }
+                (self.encoding, self.encoding_origin, false)
             }
-            SaveEncodingPolicy::Convert(encoding) => encoding,
+            SaveEncodingPolicy::Convert(encoding) => {
+                (encoding, DocumentEncodingOrigin::SaveConversion, true)
+            }
         };
-        self.prepare_save_with_encoding_and_policy(path, encoding, compaction_policy)
+        self.prepare_save_with_encoding_and_policy(
+            path,
+            encoding,
+            encoding_origin,
+            explicit_conversion,
+            compaction_policy,
+        )
     }
 
     pub(crate) fn prepare_save_with_encoding_and_policy(
         &mut self,
         path: &Path,
         encoding: DocumentEncoding,
+        encoding_origin: DocumentEncodingOrigin,
+        explicit_conversion: bool,
         compaction_policy: Option<CompactionPolicy>,
     ) -> Result<PreparedSave, DocumentError> {
         if let Some(policy) = compaction_policy {
             self.maybe_force_compact_before_save_with_policy(policy)?;
         }
 
-        let snapshot = if encoding.is_utf8() && self.encoding.is_utf8() {
+        let snapshot = if !explicit_conversion && encoding.is_utf8() && self.encoding.is_utf8() {
             if let Some(piece_table) = self.piece_table.as_ref() {
                 SaveSnapshot::PieceTable(PieceTableSnapshot::from_piece_table(piece_table))
             } else if let Some(rope) = self.rope.as_ref() {
@@ -393,11 +414,14 @@ impl Document {
             _ => self.file_len() as u64,
         };
 
+        let reload_after_save = !self.has_edit_buffer() || self.has_piece_table();
+
         Ok(PreparedSave {
             path: path.to_path_buf(),
             total_bytes,
-            reload_after_save: !self.has_edit_buffer(),
+            reload_after_save,
             encoding,
+            encoding_origin,
             snapshot,
         })
     }
@@ -411,6 +435,7 @@ impl Document {
         path: PathBuf,
         reload_after_save: bool,
         encoding: DocumentEncoding,
+        encoding_origin: DocumentEncodingOrigin,
     ) -> Result<(), DocumentError> {
         let previous_path = self.path.clone();
         self.indexing.store(false, Ordering::Relaxed);
@@ -421,8 +446,9 @@ impl Document {
             clear_session_sidecar(&path);
             self.path = Some(path);
             self.encoding = encoding;
+            self.encoding_origin = encoding_origin;
             self.decoding_had_errors = false;
-            self.dirty = false;
+            self.mark_clean();
             return Ok(());
         }
 
@@ -430,21 +456,7 @@ impl Document {
             clear_session_sidecar(old_path);
         }
         clear_session_sidecar(&path);
-        if encoding.is_utf8() {
-            let fresh_storage = FileStorage::open(&path).map_err(|err| match err {
-                StorageOpenError::Open(source) => DocumentError::Open {
-                    path: path.clone(),
-                    source,
-                },
-                StorageOpenError::Map(source) => DocumentError::Map {
-                    path: path.clone(),
-                    source,
-                },
-            })?;
-            *self = Self::from_storage(path, fresh_storage);
-        } else {
-            *self = Self::open_with_encoding(path, encoding)?;
-        }
+        *self = Self::reopen_with_encoding_contract(path, encoding, encoding_origin)?;
         Ok(())
     }
 
@@ -463,6 +475,7 @@ impl Document {
             completion.path,
             completion.reload_after_save,
             completion.encoding,
+            completion.encoding_origin,
         )
     }
 
@@ -482,6 +495,7 @@ impl Document {
             completion.path,
             completion.reload_after_save,
             completion.encoding,
+            completion.encoding_origin,
         )
     }
 

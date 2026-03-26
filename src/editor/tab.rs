@@ -1,7 +1,8 @@
 use super::*;
 use crate::{
-    CompactionPolicy, CompactionRecommendation, DocumentMaintenanceStatus, FragmentationStats,
-    IdleCompactionOutcome, LiteralSearchIter, MaintenanceAction,
+    CompactionPolicy, CompactionRecommendation, DocumentEncodingErrorKind,
+    DocumentMaintenanceStatus, FragmentationStats, IdleCompactionOutcome, LiteralSearchIter,
+    MaintenanceAction,
 };
 
 /// Lightweight editor-tab state with a document, cursor, and async save tracking.
@@ -196,6 +197,47 @@ impl EditorTab {
     /// Returns the current document encoding contract.
     pub fn encoding(&self) -> DocumentEncoding {
         self.core.document().encoding()
+    }
+
+    /// Returns the typed reason why preserve-save would currently fail, if any.
+    pub fn preserve_save_error(&self) -> Option<DocumentEncodingErrorKind> {
+        self.core.document().preserve_save_error()
+    }
+
+    /// Returns `true` when preserve-save is currently allowed for this tab document.
+    pub fn can_preserve_save(&self) -> bool {
+        self.core.document().can_preserve_save()
+    }
+
+    /// Returns the typed reason why the requested save options would currently fail, if any.
+    pub fn save_error_for_options(
+        &self,
+        options: DocumentSaveOptions,
+    ) -> Option<DocumentEncodingErrorKind> {
+        self.core.document().save_error_for_options(options)
+    }
+
+    /// Returns `true` when the requested save options are currently valid.
+    pub fn can_save_with_options(&self, options: DocumentSaveOptions) -> bool {
+        self.core.document().can_save_with_options(options)
+    }
+
+    /// Returns the typed reason why an explicit save conversion would currently fail, if any.
+    pub fn save_error_for_encoding(
+        &self,
+        encoding: DocumentEncoding,
+    ) -> Option<DocumentEncodingErrorKind> {
+        self.core.document().save_error_for_encoding(encoding)
+    }
+
+    /// Returns `true` when saving through the given explicit encoding is currently valid.
+    pub fn can_save_with_encoding(&self, encoding: DocumentEncoding) -> bool {
+        self.core.document().can_save_with_encoding(encoding)
+    }
+
+    /// Returns how the current encoding contract was chosen.
+    pub fn encoding_origin(&self) -> DocumentEncodingOrigin {
+        self.core.document().encoding_origin()
     }
 
     /// Returns `true` when the last open required replacement-character decoding.
@@ -741,6 +783,18 @@ impl EditorTab {
         )
     }
 
+    /// Opens a file in the tab using auto-detect first and an explicit fallback encoding.
+    pub fn open_file_with_auto_encoding_detection_and_fallback(
+        &mut self,
+        path: PathBuf,
+        encoding: DocumentEncoding,
+    ) -> Result<(), DocumentError> {
+        self.open_file_with_options(
+            path,
+            DocumentOpenOptions::new().with_auto_encoding_detection_and_fallback(encoding),
+        )
+    }
+
     /// Opens a file in the tab using an explicit encoding and resets the cursor.
     pub fn open_file_with_encoding(
         &mut self,
@@ -776,6 +830,18 @@ impl EditorTab {
         self.open_file_async_with_options(
             path,
             DocumentOpenOptions::new().with_auto_encoding_detection(),
+        )
+    }
+
+    /// Starts opening a file on a background worker using auto-detect first and an explicit fallback encoding.
+    pub fn open_file_async_with_auto_encoding_detection_and_fallback(
+        &mut self,
+        path: PathBuf,
+        encoding: DocumentEncoding,
+    ) -> Result<(), DocumentError> {
+        self.open_file_async_with_options(
+            path,
+            DocumentOpenOptions::new().with_auto_encoding_detection_and_fallback(encoding),
         )
     }
 

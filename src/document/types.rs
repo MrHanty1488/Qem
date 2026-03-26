@@ -48,6 +48,10 @@ impl DocumentEncoding {
     pub(crate) const fn as_encoding(self) -> &'static Encoding {
         self.0
     }
+
+    pub(crate) const fn from_encoding_rs(encoding: &'static Encoding) -> Self {
+        Self(encoding)
+    }
 }
 
 impl Default for DocumentEncoding {
@@ -84,6 +88,61 @@ impl fmt::Display for DocumentEncoding {
     }
 }
 
+/// Describes how the current document encoding contract was chosen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum DocumentEncodingOrigin {
+    /// A new in-memory document starts with the default UTF-8 contract.
+    #[default]
+    NewDocument,
+    /// The file was opened through Qem's default UTF-8 / ASCII fast path.
+    Utf8FastPath,
+    /// Lightweight auto-detection identified the current encoding from source bytes.
+    AutoDetected,
+    /// Auto-detection was requested but fell back to the UTF-8 fast path.
+    AutoDetectFallbackUtf8,
+    /// Auto-detection was requested and then fell back to an explicit caller override.
+    AutoDetectFallbackOverride,
+    /// The caller explicitly reinterpreted the source bytes through a chosen encoding.
+    ExplicitReinterpretation,
+    /// The current encoding contract came from an explicit save conversion.
+    SaveConversion,
+}
+
+impl DocumentEncodingOrigin {
+    /// Returns a stable lowercase identifier for logs, UI state, or JSON glue.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NewDocument => "new-document",
+            Self::Utf8FastPath => "utf8-fast-path",
+            Self::AutoDetected => "auto-detected",
+            Self::AutoDetectFallbackUtf8 => "auto-detect-fallback-utf8",
+            Self::AutoDetectFallbackOverride => "auto-detect-fallback-override",
+            Self::ExplicitReinterpretation => "explicit-reinterpretation",
+            Self::SaveConversion => "save-conversion",
+        }
+    }
+
+    /// Returns `true` when auto-detection participated in the current contract.
+    pub const fn used_auto_detection(self) -> bool {
+        matches!(
+            self,
+            Self::AutoDetected
+                | Self::AutoDetectFallbackUtf8
+                | Self::AutoDetectFallbackOverride
+        )
+    }
+
+    /// Returns `true` when the contract came from an explicit caller choice.
+    pub const fn is_explicit(self) -> bool {
+        matches!(
+            self,
+            Self::AutoDetectFallbackOverride
+                | Self::ExplicitReinterpretation
+                | Self::SaveConversion
+        )
+    }
+}
+
 /// Open policy for choosing between the UTF-8 mmap fast path, initial
 /// BOM-backed detection, or an explicit reinterpretation encoding.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -97,6 +156,13 @@ pub enum OpenEncodingPolicy {
     /// This first detection slice intentionally avoids heavyweight legacy
     /// charset guessing so open-time cost stays predictable.
     AutoDetect,
+    /// Detect BOM-backed encodings first and otherwise reinterpret the source
+    /// through the requested fallback encoding.
+    ///
+    /// This keeps the cheap BOM-backed detection path while still letting a
+    /// caller say "if you do not detect anything stronger, use this explicit
+    /// encoding instead of plain UTF-8 fast-path behavior".
+    AutoDetectOrReinterpret(DocumentEncoding),
     /// Reinterpret the source bytes through the requested encoding.
     ///
     /// This is the option to use for legacy encodings such as
@@ -126,6 +192,16 @@ impl DocumentOpenOptions {
         self
     }
 
+    /// Returns options that try auto-detection first and otherwise reinterpret
+    /// the source through `encoding`.
+    pub const fn with_auto_encoding_detection_and_fallback(
+        mut self,
+        encoding: DocumentEncoding,
+    ) -> Self {
+        self.encoding_policy = OpenEncodingPolicy::AutoDetectOrReinterpret(encoding);
+        self
+    }
+
     /// Returns options that reinterpret the source through the given encoding.
     pub const fn with_reinterpretation(mut self, encoding: DocumentEncoding) -> Self {
         self.encoding_policy = OpenEncodingPolicy::Reinterpret(encoding);
@@ -146,13 +222,14 @@ impl DocumentOpenOptions {
         self.encoding_policy
     }
 
-    /// Returns the explicit reinterpretation encoding, if one was requested.
+    /// Returns the explicit reinterpretation or fallback encoding, if one was requested.
     ///
     /// This compatibility helper returns `None` for the default fast path and
     /// for auto-detect mode.
     pub const fn encoding_override(self) -> Option<DocumentEncoding> {
         match self.encoding_policy {
-            OpenEncodingPolicy::Reinterpret(encoding) => Some(encoding),
+            OpenEncodingPolicy::Reinterpret(encoding)
+            | OpenEncodingPolicy::AutoDetectOrReinterpret(encoding) => Some(encoding),
             OpenEncodingPolicy::Utf8FastPath | OpenEncodingPolicy::AutoDetect => None,
         }
     }
@@ -843,6 +920,8 @@ pub struct DocumentStatus {
     line_count: LineCount,
     line_ending: LineEnding,
     encoding: DocumentEncoding,
+    preserve_save_error: Option<DocumentEncodingErrorKind>,
+    encoding_origin: DocumentEncodingOrigin,
     decoding_had_errors: bool,
     indexing: Option<ByteProgress>,
     backing: DocumentBacking,
@@ -858,6 +937,8 @@ impl DocumentStatus {
         line_count: LineCount,
         line_ending: LineEnding,
         encoding: DocumentEncoding,
+        preserve_save_error: Option<DocumentEncodingErrorKind>,
+        encoding_origin: DocumentEncodingOrigin,
         decoding_had_errors: bool,
         indexing: Option<ByteProgress>,
         backing: DocumentBacking,
@@ -869,6 +950,8 @@ impl DocumentStatus {
             line_count,
             line_ending,
             encoding,
+            preserve_save_error,
+            encoding_origin,
             decoding_had_errors,
             indexing,
             backing,
@@ -918,6 +1001,21 @@ impl DocumentStatus {
     /// Returns the current document encoding contract.
     pub fn encoding(&self) -> DocumentEncoding {
         self.encoding
+    }
+
+    /// Returns the typed reason why preserve-save would currently fail, if any.
+    pub fn preserve_save_error(&self) -> Option<DocumentEncodingErrorKind> {
+        self.preserve_save_error
+    }
+
+    /// Returns `true` when preserve-save is currently allowed for this document snapshot.
+    pub fn can_preserve_save(&self) -> bool {
+        self.preserve_save_error().is_none()
+    }
+
+    /// Returns how the current encoding contract was chosen.
+    pub fn encoding_origin(&self) -> DocumentEncodingOrigin {
+        self.encoding_origin
     }
 
     /// Returns `true` when opening the source required lossy decode replacement.
@@ -1058,6 +1156,49 @@ impl DocumentMaintenanceStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DocumentEncodingErrorKind {
+    /// Opening this encoding would require a full transcode beyond the current safety limit.
+    OpenTranscodeTooLarge { max_bytes: usize },
+    /// Preserving the current decoded encoding contract is not supported on save yet.
+    PreserveSaveUnsupported,
+    /// Preserving the current decoded encoding would cement a lossy open.
+    LossyDecodedPreserve,
+    /// The requested save target is not yet supported as a direct output encoding.
+    UnsupportedSaveTarget,
+    /// `encoding_rs` redirected the save target to a different output encoding.
+    RedirectedSaveTarget { actual: DocumentEncoding },
+    /// The current document text cannot be represented in the requested encoding.
+    UnrepresentableText,
+}
+
+impl std::fmt::Display for DocumentEncodingErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OpenTranscodeTooLarge { max_bytes } => write!(
+                f,
+                "non-UTF8 open currently requires full transcoding and is limited to {max_bytes} bytes"
+            ),
+            Self::PreserveSaveUnsupported => f.write_str(
+                "preserve-save is not yet supported for this encoding; use DocumentSaveOptions::with_encoding(...) to convert to a supported target",
+            ),
+            Self::LossyDecodedPreserve => f.write_str(
+                "preserve-save is rejected because opening this document already required lossy decoding; convert explicitly if you want to keep the repaired text",
+            ),
+            Self::UnsupportedSaveTarget => {
+                f.write_str("this encoding is not yet supported as a save target")
+            }
+            Self::RedirectedSaveTarget { actual } => write!(
+                f,
+                "encoding_rs redirected this save target to `{actual}`"
+            ),
+            Self::UnrepresentableText => f.write_str(
+                "the current document contains characters that are not representable in the target encoding",
+            ),
+        }
+    }
+}
+
 /// File-system, mapping, and edit-capability errors produced by [`crate::document::Document`].
 #[derive(Debug)]
 pub enum DocumentError {
@@ -1072,7 +1213,7 @@ pub enum DocumentError {
         path: PathBuf,
         operation: &'static str,
         encoding: DocumentEncoding,
-        message: String,
+        reason: DocumentEncodingErrorKind,
     },
     /// The requested edit operation is unsupported for the current document state.
     EditUnsupported {
@@ -1091,10 +1232,10 @@ impl std::fmt::Display for DocumentError {
                 path,
                 operation,
                 encoding,
-                message,
+                reason,
             } => write!(
                 f,
-                "{operation} `{}` with encoding `{encoding}`: {message}",
+                "{operation} `{}` with encoding `{encoding}`: {reason}",
                 path.display()
             ),
             Self::EditUnsupported { path, reason } => {

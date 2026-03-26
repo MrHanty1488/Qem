@@ -1,3 +1,4 @@
+use crate::document::DocumentEncodingOrigin;
 use crate::source_identity::{sampled_content_fingerprint, sampled_file_fingerprint};
 use crate::storage::FileStorage;
 use crc32fast::Hasher;
@@ -34,6 +35,8 @@ const INTERNAL_ENTRY_BYTES: usize = 24;
 const HISTORY_ENTRY_BYTES: usize = 32;
 const DEFAULT_FRAGMENTATION_SMALL_PIECE_BYTES: usize = 1024;
 const EDITLOG_FLAG_FULL_INDEX: u64 = 1;
+const EDITLOG_FLAG_HAS_ENCODING_ORIGIN: u64 = 1 << 1;
+const EDITLOG_FLAG_DECODING_HAD_ERRORS: u64 = 1 << 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PieceSource {
@@ -140,6 +143,33 @@ struct ChildRef {
 pub(crate) struct SessionMeta {
     pub(crate) known_byte_len: usize,
     pub(crate) full_index: bool,
+    pub(crate) encoding_origin: Option<DocumentEncodingOrigin>,
+    pub(crate) decoding_had_errors: bool,
+}
+
+fn encode_encoding_origin(origin: DocumentEncodingOrigin) -> u32 {
+    match origin {
+        DocumentEncodingOrigin::NewDocument => 1,
+        DocumentEncodingOrigin::Utf8FastPath => 2,
+        DocumentEncodingOrigin::AutoDetected => 3,
+        DocumentEncodingOrigin::AutoDetectFallbackUtf8 => 4,
+        DocumentEncodingOrigin::AutoDetectFallbackOverride => 5,
+        DocumentEncodingOrigin::ExplicitReinterpretation => 6,
+        DocumentEncodingOrigin::SaveConversion => 7,
+    }
+}
+
+fn decode_encoding_origin(raw: u32) -> Option<DocumentEncodingOrigin> {
+    match raw {
+        1 => Some(DocumentEncodingOrigin::NewDocument),
+        2 => Some(DocumentEncodingOrigin::Utf8FastPath),
+        3 => Some(DocumentEncodingOrigin::AutoDetected),
+        4 => Some(DocumentEncodingOrigin::AutoDetectFallbackUtf8),
+        5 => Some(DocumentEncodingOrigin::AutoDetectFallbackOverride),
+        6 => Some(DocumentEncodingOrigin::ExplicitReinterpretation),
+        7 => Some(DocumentEncodingOrigin::SaveConversion),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -235,6 +265,7 @@ struct EditLogHeader {
     add_len: u64,
     known_byte_len: u64,
     flags: u64,
+    encoding_origin: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -1058,6 +1089,10 @@ impl DiskPageStore {
         let meta = SessionMeta {
             known_byte_len: header.known_byte_len as usize,
             full_index: (header.flags & EDITLOG_FLAG_FULL_INDEX) != 0,
+            encoding_origin: ((header.flags & EDITLOG_FLAG_HAS_ENCODING_ORIGIN) != 0)
+                .then(|| decode_encoding_origin(header.encoding_origin))
+                .flatten(),
+            decoding_had_errors: (header.flags & EDITLOG_FLAG_DECODING_HAD_ERRORS) != 0,
         };
 
         Ok(Some((
@@ -1180,11 +1215,20 @@ impl DiskPageStore {
             add_page_count: add_page_count as u64,
             add_len: add_bytes.len() as u64,
             known_byte_len: meta.known_byte_len as u64,
-            flags: if meta.full_index {
+            flags: (if meta.full_index {
                 EDITLOG_FLAG_FULL_INDEX
             } else {
                 0
-            },
+            }) | (if meta.encoding_origin.is_some() {
+                EDITLOG_FLAG_HAS_ENCODING_ORIGIN
+            } else {
+                0
+            }) | (if meta.decoding_had_errors {
+                EDITLOG_FLAG_DECODING_HAD_ERRORS
+            } else {
+                0
+            }),
+            encoding_origin: meta.encoding_origin.map(encode_encoding_origin).unwrap_or(0),
         };
         // Durability protocol:
         // 1. append all newly reachable pages first
@@ -1306,12 +1350,13 @@ fn write_editlog_header(file: &mut File, header: EditLogHeader) -> io::Result<()
     buf[96..104].copy_from_slice(&header.add_len.to_le_bytes());
     buf[104..112].copy_from_slice(&header.known_byte_len.to_le_bytes());
     buf[112..120].copy_from_slice(&header.flags.to_le_bytes());
-    let committed_at_ns = SystemTime::now()
+    buf[120..124].copy_from_slice(&header.encoding_origin.to_le_bytes());
+    let committed_at_s = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos()
-        .min(u64::MAX as u128) as u64;
-    buf[120..128].copy_from_slice(&committed_at_ns.to_le_bytes());
+        .as_secs()
+        .min(u32::MAX as u64) as u32;
+    buf[124..128].copy_from_slice(&committed_at_s.to_le_bytes());
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&buf)
 }
@@ -1348,6 +1393,7 @@ fn read_editlog_header(file: &mut File) -> io::Result<EditLogHeader> {
         add_len: u64::from_le_bytes(buf[96..104].try_into().unwrap_or([0; 8])),
         known_byte_len: u64::from_le_bytes(buf[104..112].try_into().unwrap_or([0; 8])),
         flags: u64::from_le_bytes(buf[112..120].try_into().unwrap_or([0; 8])),
+        encoding_origin: u32::from_le_bytes(buf[120..124].try_into().unwrap_or([0; 4])),
     })
 }
 

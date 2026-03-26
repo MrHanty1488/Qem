@@ -129,7 +129,13 @@ impl Document {
                 // Editing should stay responsive: stop the background indexer once
                 // we switch to a mutable buffer.
                 self.indexing.store(false, Ordering::Relaxed);
-                self.piece_table = Some(PieceTable::new(storage, line_lengths, full_index));
+                self.piece_table = Some(PieceTable::new_with_encoding_state(
+                    storage,
+                    line_lengths,
+                    full_index,
+                    self.encoding_origin,
+                    self.decoding_had_errors,
+                ));
                 Ok(())
             }
             EditBufferPlan::CreateRope => {
@@ -158,8 +164,15 @@ impl Document {
                 "document is too large to materialize into a rope; editing this region is disabled",
             ));
         }
-        let bytes = self.mmap_bytes();
-        self.rope = Some(build_rope_from_bytes(bytes));
+        let (rope, had_errors) = {
+            let bytes = self.mmap_bytes();
+            build_rope_from_bytes(bytes)
+        };
+        if had_errors && !self.decoding_had_errors {
+            self.decoding_had_errors = true;
+            self.invalidate_preserve_save_error_cache();
+        }
+        self.rope = Some(rope);
         Ok(())
     }
 
@@ -179,14 +192,19 @@ impl Document {
             ));
         }
         let bytes = piece_table.read_range(0, piece_table.total_len());
-        self.rope = Some(build_rope_from_bytes(&bytes));
+        let (rope, had_errors) = build_rope_from_bytes(&bytes);
+        if had_errors && !self.decoding_had_errors {
+            self.decoding_had_errors = true;
+            self.invalidate_preserve_save_error_cache();
+        }
+        self.rope = Some(rope);
         Ok(())
     }
 
     pub(super) fn rope_mut(&mut self) -> Result<&mut Rope, DocumentError> {
         let path = self.path.clone();
         self.ensure_rope()?;
-        self.dirty = true;
+        self.mark_dirty();
         let Some(rope) = self.rope.as_mut() else {
             return Err(DocumentError::EditUnsupported {
                 path,

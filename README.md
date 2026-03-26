@@ -45,14 +45,14 @@ next `Document::open`, as long as the source file identity still matches.
 
 ```toml
 [dependencies]
-qem = "0.5.4"
+qem = "0.6.0"
 ```
 
 To disable the editor/session wrapper and use only the document/storage layer:
 
 ```toml
 [dependencies]
-qem = { version = "0.5.4", default-features = false }
+qem = { version = "0.6.0", default-features = false }
 ```
 
 ## Cargo features
@@ -69,7 +69,7 @@ Example:
 
 ```toml
 [dependencies]
-qem = { version = "0.5.4", default-features = false, features = ["editor", "tmp-exe-dir"] }
+qem = { version = "0.6.0", default-features = false, features = ["editor", "tmp-exe-dir"] }
 ```
 
 Runtime override is also available:
@@ -117,9 +117,9 @@ the selected temp policy.
 
 - UTF-8 / ASCII text is the primary stable fast path: open, viewport reads, edits, undo/redo, and saves are supported without transcoding.
 - Explicit legacy-encoding open/save is available through `Document::open_with_encoding(...)`, `Document::save_to_with_encoding(...)`, and the matching `DocumentSession` / `EditorTab` wrappers. For BOM-backed UTF-16 files there is also a convenience `Document::open_with_auto_encoding_detection(...)` path. If you want a more extensible contract now, the same flows are also exposed through `DocumentOpenOptions`, `OpenEncodingPolicy`, and `DocumentSaveOptions`.
-- Auto-detect open currently recognizes BOM-backed UTF-16 files and otherwise keeps the normal UTF-8 / ASCII fast path. Legacy encodings without a BOM still require an explicit reinterpretation encoding.
+- Auto-detect open currently recognizes BOM-backed UTF-16 files and otherwise keeps the normal UTF-8 / ASCII fast path. If you already know a likely legacy fallback, you can opt into "detect first, otherwise reinterpret as X" through `DocumentOpenOptions::with_auto_encoding_detection_and_fallback(...)` and the matching session/tab helpers.
 - Non-UTF8 opens currently materialize into a rope-backed document instead of using the mmap fast path. Very large legacy-encoded files may therefore still be rejected until the broader encoding contract lands in a later release.
-- Preserve-save for some decoded encodings can still return a typed encoding error until a broader persistence contract lands. Today you can explicitly convert on save through `DocumentSaveOptions::with_encoding(...)` or `Document::save_to_with_encoding(...)`.
+- `decoding_had_errors()` now means Qem has already seen malformed source bytes, but preserve-save is only rejected when the write would materialize lossy-decoded text. Clean raw mmap / piece-table preserve can still stay allowed, while rope-backed legacy opens and UTF-8 documents after lossy materialization/edit correctly fail with a typed `LossyDecodedPreserve`. You can preflight those cases through `preserve_save_error()` / `save_error_for_options(...)`, or explicitly convert on save through `DocumentSaveOptions::with_encoding(...)` and `Document::save_to_with_encoding(...)`.
 - Huge files are supported for mmap-backed reads, viewport rendering, line-count estimation, and background indexing without full materialization. Editing may be rejected when it would require unsafe rope promotion beyond the built-in size limits.
 - `.qem.lineidx` and `.qem.editlog` are internal cache/session sidecars. Qem invalidates them when file length, modification time, or sampled content fingerprint no longer match. Their on-disk formats are internal implementation details rather than stable interchange formats, so Qem may rebuild, discard, or version-bump them across releases.
 - Typed progress/state APIs such as `indexing_state()`, `loading_state()`, `loading_phase()`, `save_state()`, `background_issue()`, `take_background_issue()`, and `close_pending()` are the supported session-facing surface.
@@ -287,8 +287,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if doc.decoding_had_errors() {
         eprintln!("source contained malformed byte sequences for {}", doc.encoding());
     }
+    if let Some(reason) = doc.preserve_save_error() {
+        eprintln!("preserve-save would not be safe yet: {reason}");
+    }
 
     let _ = doc.try_insert_text_at(0, 0, "header: ")?;
+    if let Some(reason) = doc.save_error_for_encoding(DocumentEncoding::utf8()) {
+        eprintln!("cannot convert this document to utf-8 yet: {reason}");
+        return Ok(());
+    }
     doc.save_to_with_options(
         target,
         DocumentSaveOptions::new().with_encoding(DocumentEncoding::utf8()),

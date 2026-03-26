@@ -26,7 +26,7 @@ impl Document {
                 .insert_text_at(self.line_ending, line0, col0, text)
                 .map_err(|source| DocumentError::Write { path, source })?;
             if outcome.edited {
-                self.dirty = true;
+                self.mark_dirty();
             }
             return Ok(outcome.cursor);
         }
@@ -111,16 +111,28 @@ impl Document {
 
         let doc_path = self.path.clone();
         if let Some(piece_table) = self.piece_table.as_mut() {
-            let actual_col0 = piece_table.line_len_chars(line0);
-            let start_col0 = col0.min(actual_col0);
-            let start = piece_table.byte_offset_for_col(line0, start_col0);
-            let end = piece_table.advance_offset_by_text_units(start, len_chars);
-            if end > start {
-                self.dirty = true;
-                let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
-                piece_table
-                    .delete_range(start, end - start)
-                    .map_err(|source| DocumentError::Write { path, source })?;
+            let (start_col0, edited, delete_result) = {
+                let actual_col0 = piece_table.line_len_chars(line0);
+                let start_col0 = col0.min(actual_col0);
+                let start = piece_table.byte_offset_for_col(line0, start_col0);
+                let end = piece_table.advance_offset_by_text_units(start, len_chars);
+                let delete_result = if end > start {
+                    let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
+                    Some(
+                        piece_table
+                            .delete_range(start, end - start)
+                            .map_err(|source| DocumentError::Write { path, source }),
+                    )
+                } else {
+                    None
+                };
+                (start_col0, end > start, delete_result)
+            };
+            if edited {
+                self.mark_dirty();
+            }
+            if let Some(delete_result) = delete_result {
+                delete_result?;
             }
             return Ok((line0, start_col0));
         }
@@ -135,7 +147,7 @@ impl Document {
         let end = start.saturating_add(len_chars).min(rope.len_chars());
         if end > start {
             rope.remove(start..end);
-            self.dirty = true;
+            self.mark_dirty();
         }
         Ok((line0, start_col0))
     }
@@ -167,7 +179,7 @@ impl Document {
                 .replace_range_at(self.line_ending, line0, col0, len_chars, text)
                 .map_err(|source| DocumentError::Write { path, source })?;
             if outcome.edited {
-                self.dirty = true;
+                self.mark_dirty();
             }
             return Ok(outcome.cursor);
         }
@@ -251,12 +263,12 @@ impl Document {
             match piece_table.backspace_at(line0, col0) {
                 Ok((edited, new_line0, new_col0)) => {
                     if edited {
-                        self.dirty = true;
+                        self.mark_dirty();
                     }
                     return Ok((edited, new_line0, new_col0));
                 }
                 Err(source) => {
-                    self.dirty = true;
+                    self.mark_dirty();
                     return Err(DocumentError::Write { path, source });
                 }
             }
@@ -334,16 +346,28 @@ impl Document {
 
         let doc_path = self.path.clone();
         if let Some(piece_table) = self.piece_table.as_mut() {
-            let actual_col0 = piece_table.line_len_chars(line0);
-            let start_col0 = col0.min(actual_col0);
-            let start = piece_table.byte_offset_for_col(line0, start_col0);
-            let end = piece_table.advance_offset_by_text_units(start, 1);
-            if end > start {
-                self.dirty = true;
-                let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
-                piece_table
-                    .delete_range(start, end - start)
-                    .map_err(|source| DocumentError::Write { path, source })?;
+            let (start_col0, edited, delete_result) = {
+                let actual_col0 = piece_table.line_len_chars(line0);
+                let start_col0 = col0.min(actual_col0);
+                let start = piece_table.byte_offset_for_col(line0, start_col0);
+                let end = piece_table.advance_offset_by_text_units(start, 1);
+                let delete_result = if end > start {
+                    let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
+                    Some(
+                        piece_table
+                            .delete_range(start, end - start)
+                            .map_err(|source| DocumentError::Write { path, source }),
+                    )
+                } else {
+                    None
+                };
+                (start_col0, end > start, delete_result)
+            };
+            if edited {
+                self.mark_dirty();
+            }
+            if let Some(delete_result) = delete_result {
+                delete_result?;
                 return Ok((true, line0, start_col0));
             }
             return Ok((false, line0, start_col0));
@@ -360,7 +384,7 @@ impl Document {
             return Ok((false, line0, start_col0));
         }
         rope.remove(start..(start + 1));
-        self.dirty = true;
+        self.mark_dirty();
         Ok((true, line0, start_col0))
     }
 

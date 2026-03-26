@@ -3,11 +3,12 @@ use super::{
     SaveError,
 };
 use crate::{
-    CompactionPolicy, CompactionUrgency, DocumentBacking, DocumentEncoding, DocumentError,
-    EditCapability, IdleCompactionOutcome, LiteralSearchQuery, MaintenanceAction, TextPosition,
-    TextSelection, ViewportRequest,
+    CompactionPolicy, CompactionUrgency, DocumentBacking, DocumentEncoding,
+    DocumentEncodingErrorKind, DocumentEncodingOrigin, DocumentError, EditCapability,
+    IdleCompactionOutcome, LiteralSearchQuery, MaintenanceAction, TextPosition, TextSelection,
+    ViewportRequest,
 };
-use encoding_rs::WINDOWS_1251;
+use encoding_rs::{GB18030, SHIFT_JIS, WINDOWS_1251};
 use std::fs;
 use std::time::{Duration, Instant};
 
@@ -63,6 +64,10 @@ fn session_open_file_with_encoding_exposes_decoded_text() {
         .unwrap();
 
     assert_eq!(session.encoding(), encoding);
+    assert_eq!(
+        session.encoding_origin(),
+        DocumentEncodingOrigin::ExplicitReinterpretation
+    );
     assert!(!session.decoding_had_errors());
     assert_eq!(session.text(), "привет\n");
 
@@ -111,6 +116,53 @@ fn session_open_file_with_options_and_save_as_with_options_work() {
 }
 
 #[test]
+fn session_open_file_with_encoding_gb18030_round_trips_default_save() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-encoding-gb18030-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("legacy-gb18030.txt");
+    let saved = dir.join("legacy-gb18030-saved.txt");
+    let encoding = DocumentEncoding::from_label("gb18030").unwrap();
+    let source_text = "你好世界\n";
+    let inserted_text = "追加\n";
+    let expected_text = format!("{inserted_text}{source_text}");
+    let (bytes, used, had_errors) = GB18030.encode(source_text);
+    assert_eq!(used, GB18030);
+    assert!(!had_errors);
+    fs::write(&path, bytes.as_ref()).unwrap();
+
+    let mut session = DocumentSession::new();
+    session.open_file_with_encoding(path.clone(), encoding).unwrap();
+
+    assert_eq!(session.encoding(), encoding);
+    assert_eq!(
+        session.encoding_origin(),
+        DocumentEncodingOrigin::ExplicitReinterpretation
+    );
+    assert!(!session.decoding_had_errors());
+    assert_eq!(session.text(), source_text);
+
+    let _ = session
+        .try_insert(TextPosition::new(0, 0), inserted_text)
+        .unwrap();
+    session
+        .save_as_with_options(saved.clone(), crate::DocumentSaveOptions::new())
+        .unwrap();
+
+    let raw = fs::read(&saved).unwrap();
+    let (decoded, used, had_errors) = GB18030.decode(&raw);
+    assert_eq!(used, GB18030);
+    assert!(!had_errors);
+    assert_eq!(decoded, expected_text);
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&saved);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn session_open_file_with_auto_detection_handles_utf16le_bom() {
     let dir = std::env::temp_dir().join(format!(
         "qem-editor-encoding-autodetect-{}",
@@ -130,9 +182,518 @@ fn session_open_file_with_auto_detection_handles_utf16le_bom() {
         .unwrap();
 
     assert_eq!(session.encoding(), DocumentEncoding::utf16le());
+    assert_eq!(session.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
     assert_eq!(session.text(), "hello\n");
 
     let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_open_file_with_auto_detection_and_fallback_reinterprets_when_needed() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-encoding-autodetect-fallback-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("valid-utf8-no-bom.txt");
+    let encoding = DocumentEncoding::from_label("windows-1252").unwrap();
+    fs::write(&path, "caf\u{00E9}\n".as_bytes()).unwrap();
+
+    let mut session = DocumentSession::new();
+    session
+        .open_file_with_auto_encoding_detection_and_fallback(path.clone(), encoding)
+        .unwrap();
+
+    assert_eq!(session.encoding(), encoding);
+    assert_eq!(
+        session.encoding_origin(),
+        DocumentEncodingOrigin::AutoDetectFallbackOverride
+    );
+    assert_eq!(session.text(), "caf\u{00C3}\u{00A9}\n");
+
+    let status = session.status();
+    assert_eq!(status.encoding(), encoding);
+    assert_eq!(
+        status.encoding_origin(),
+        DocumentEncodingOrigin::AutoDetectFallbackOverride
+    );
+    assert!(!status.decoding_had_errors());
+    assert_eq!(status.document().encoding(), encoding);
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_save_as_with_encoding_surfaces_typed_unrepresentable_error() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-encoding-save-error-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("emoji-cp1251.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+
+    let mut session = DocumentSession::new();
+    let _ = session
+        .document_mut()
+        .try_insert(TextPosition::new(0, 0), "emoji \u{1F642}\n")
+        .unwrap();
+
+    let err = session.save_as_with_encoding(path.clone(), encoding).unwrap_err();
+    assert!(matches!(
+        err,
+        DocumentError::Encoding {
+            path: failed_path,
+            operation: "save",
+            encoding: failed_encoding,
+            reason: DocumentEncodingErrorKind::UnrepresentableText,
+        } if failed_path == path && failed_encoding == encoding
+    ));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_preserve_save_rejects_lossy_shift_jis_source() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-lossy-shift-jis-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("lossy-shift-jis.txt");
+    let saved = dir.join("lossy-shift-jis-saved.txt");
+    let encoding = DocumentEncoding::from_label("shift_jis").unwrap();
+    let invalid_bytes = [0x82];
+    let (_, _, had_errors) = SHIFT_JIS.decode(&invalid_bytes);
+    assert!(had_errors);
+    fs::write(&path, invalid_bytes).unwrap();
+
+    let mut session = DocumentSession::new();
+    session.open_file_with_encoding(path.clone(), encoding).unwrap();
+
+    assert!(session.decoding_had_errors());
+    assert_eq!(session.text(), "\u{FFFD}");
+    assert!(session.status().decoding_had_errors());
+    assert!(!session.can_preserve_save());
+    assert_eq!(
+        session.preserve_save_error(),
+        Some(DocumentEncodingErrorKind::LossyDecodedPreserve)
+    );
+    assert_eq!(
+        session.status().preserve_save_error(),
+        Some(DocumentEncodingErrorKind::LossyDecodedPreserve)
+    );
+
+    let err = session
+        .save_as_with_options(saved.clone(), crate::DocumentSaveOptions::new())
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DocumentError::Encoding {
+            path: failed_path,
+            operation: "save",
+            encoding: failed_encoding,
+            reason: DocumentEncodingErrorKind::LossyDecodedPreserve,
+        } if failed_path == saved && failed_encoding == encoding
+    ));
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_editing_invalid_utf8_fast_path_surfaces_lossy_preserve_contract() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-invalid-utf8-fast-path-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("invalid-utf8-fast-path.txt");
+    let saved = dir.join("invalid-utf8-fast-path-saved.txt");
+    fs::write(&path, [0x66, 0x6f, 0x80, 0x6f, b'\n']).unwrap();
+
+    let mut session = DocumentSession::new();
+    session.open_file(path.clone()).unwrap();
+    assert!(session.decoding_had_errors());
+    assert!(session.can_preserve_save());
+
+    let _ = session.try_insert(TextPosition::new(0, 0), "X").unwrap();
+
+    assert!(session.decoding_had_errors());
+    assert_eq!(
+        session.preserve_save_error(),
+        Some(DocumentEncodingErrorKind::LossyDecodedPreserve)
+    );
+    assert_eq!(
+        session.status().preserve_save_error(),
+        Some(DocumentEncodingErrorKind::LossyDecodedPreserve)
+    );
+
+    let err = session
+        .save_as_with_options(saved.clone(), crate::DocumentSaveOptions::new())
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DocumentError::Encoding {
+            path: failed_path,
+            operation: "save",
+            encoding,
+            reason: DocumentEncodingErrorKind::LossyDecodedPreserve,
+        } if failed_path == saved && encoding == DocumentEncoding::utf8()
+    ));
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_save_as_async_same_path_utf8_convert_sanitizes_clean_invalid_utf8() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-async-same-path-utf8-convert-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("invalid-utf8-fast-path.txt");
+    fs::write(&path, [0x66, 0x6f, 0x80, 0x6f, b'\n']).unwrap();
+
+    let mut session = DocumentSession::new();
+    session.open_file(path.clone()).unwrap();
+    assert!(session.decoding_had_errors());
+    assert!(session.can_preserve_save());
+
+    let started = session
+        .save_as_async_with_encoding(path.clone(), DocumentEncoding::utf8())
+        .unwrap();
+    assert!(started);
+    assert!(session.is_saving());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(result) = session.poll_background_job() {
+            result.unwrap();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "async same-path utf8 conversion timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(session.encoding(), DocumentEncoding::utf8());
+    assert_eq!(session.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert!(!session.decoding_had_errors());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "fo\u{FFFD}o\n");
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tab_save_as_async_same_path_utf8_convert_sanitizes_clean_invalid_utf8() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-tab-async-same-path-utf8-convert-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("invalid-utf8-fast-path.txt");
+    fs::write(&path, [0x66, 0x6f, 0x80, 0x6f, b'\n']).unwrap();
+
+    let mut tab = EditorTab::new(314);
+    tab.open_file(path.clone()).unwrap();
+    assert!(tab.decoding_had_errors());
+    assert!(tab.can_preserve_save());
+
+    let started = tab
+        .save_as_async_with_encoding(path.clone(), DocumentEncoding::utf8())
+        .unwrap();
+    assert!(started);
+    assert!(tab.is_saving());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(result) = tab.poll_background_job() {
+            result.unwrap();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tab async same-path utf8 conversion timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(tab.encoding(), DocumentEncoding::utf8());
+    assert_eq!(tab.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert!(!tab.decoding_had_errors());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "fo\u{FFFD}o\n");
+
+    let status = tab.status();
+    assert_eq!(status.encoding(), DocumentEncoding::utf8());
+    assert_eq!(status.encoding_origin(), DocumentEncodingOrigin::SaveConversion);
+    assert!(!status.decoding_had_errors());
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_and_tab_save_conversion_preflight_reports_success_and_failures() {
+    let cp1251 = DocumentEncoding::from_label("windows-1251").unwrap();
+
+    let mut session = DocumentSession::new();
+    let _ = session
+        .document_mut()
+        .try_insert(TextPosition::new(0, 0), "\u{043F}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}\n")
+        .unwrap();
+    assert_eq!(session.save_error_for_encoding(cp1251), None);
+    assert!(session.can_save_with_encoding(cp1251));
+
+    let mut tab = EditorTab::new(77);
+    let _ = tab
+        .document_mut()
+        .try_insert(TextPosition::new(0, 0), "emoji \u{1F642}\n")
+        .unwrap();
+    assert_eq!(
+        tab.save_error_for_encoding(cp1251),
+        Some(DocumentEncodingErrorKind::UnrepresentableText)
+    );
+    assert!(!tab.can_save_with_encoding(cp1251));
+    assert_eq!(
+        tab.save_error_for_options(
+            crate::DocumentSaveOptions::new().with_encoding(DocumentEncoding::utf16le())
+        ),
+        Some(DocumentEncodingErrorKind::UnsupportedSaveTarget)
+    );
+}
+
+#[test]
+fn session_preserve_save_preflight_reports_unrepresentable_legacy_edits() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-legacy-preflight-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("legacy-cp1251.txt");
+    let saved = dir.join("legacy-cp1251-saved.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+    let (bytes, used, had_errors) = WINDOWS_1251.encode("\u{043F}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}\n");
+    assert_eq!(used, WINDOWS_1251);
+    assert!(!had_errors);
+    fs::write(&path, bytes.as_ref()).unwrap();
+
+    let mut session = DocumentSession::new();
+    session.open_file_with_encoding(path.clone(), encoding).unwrap();
+    let _ = session
+        .try_insert(TextPosition::new(0, 0), "emoji \u{1F642}\n")
+        .unwrap();
+
+    assert_eq!(
+        session.preserve_save_error(),
+        Some(DocumentEncodingErrorKind::UnrepresentableText)
+    );
+    assert!(!session.can_preserve_save());
+    assert_eq!(
+        session.save_error_for_options(crate::DocumentSaveOptions::new()),
+        Some(DocumentEncodingErrorKind::UnrepresentableText)
+    );
+    assert_eq!(
+        session.status().preserve_save_error(),
+        Some(DocumentEncodingErrorKind::UnrepresentableText)
+    );
+
+    let err = session
+        .save_as_with_options(saved.clone(), crate::DocumentSaveOptions::new())
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DocumentError::Encoding {
+            path: failed_path,
+            operation: "save",
+            encoding: failed_encoding,
+            reason: DocumentEncodingErrorKind::UnrepresentableText,
+        } if failed_path == saved && failed_encoding == encoding
+    ));
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_save_async_rejects_invalid_preserve_without_starting_job() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-async-preserve-reject-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("lossy-shift-jis.txt");
+    let encoding = DocumentEncoding::from_label("shift_jis").unwrap();
+    fs::write(&path, [0x82]).unwrap();
+
+    let mut session = DocumentSession::new();
+    session.open_file_with_encoding(path.clone(), encoding).unwrap();
+    let _ = session.try_insert(TextPosition::new(0, 0), "x").unwrap();
+
+    let err = session.save_async().unwrap_err();
+    assert!(matches!(
+        err,
+        SaveError::Io(DocumentError::Encoding {
+            path: failed_path,
+            operation: "save",
+            encoding: failed_encoding,
+            reason: DocumentEncodingErrorKind::LossyDecodedPreserve,
+        }) if failed_path == path && failed_encoding == encoding
+    ));
+    assert!(!session.is_saving());
+    assert!(session.save_state().is_none());
+    assert!(session.background_issue().is_none());
+    assert!(matches!(session.background_activity(), BackgroundActivity::Idle));
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tab_open_file_async_with_auto_detection_and_fallback_prefers_detected_bom() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-tab-autodetect-fallback-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("utf16le-source.txt");
+    let fallback = DocumentEncoding::from_label("windows-1251").unwrap();
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in "hello\n".encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    fs::write(&path, bytes).unwrap();
+
+    let mut tab = EditorTab::new(99);
+    tab.open_file_async_with_auto_encoding_detection_and_fallback(path.clone(), fallback)
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(result) = tab.poll_background_job() {
+            result.unwrap();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "async auto-detect fallback tab open timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(tab.encoding(), DocumentEncoding::utf16le());
+    assert_eq!(tab.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
+    assert_eq!(tab.text(), "hello\n");
+
+    let status = tab.status();
+    assert_eq!(status.encoding(), DocumentEncoding::utf16le());
+    assert_eq!(status.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
+    assert!(!status.decoding_had_errors());
+    assert_eq!(status.document().encoding(), DocumentEncoding::utf16le());
+    assert!(!tab.can_preserve_save());
+    assert_eq!(
+        tab.preserve_save_error(),
+        Some(DocumentEncodingErrorKind::PreserveSaveUnsupported)
+    );
+    assert_eq!(
+        status.preserve_save_error(),
+        Some(DocumentEncodingErrorKind::PreserveSaveUnsupported)
+    );
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tab_open_file_async_with_auto_detection_handles_utf16be_bom() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-tab-autodetect-utf16be-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("utf16be-source.txt");
+    let mut bytes = vec![0xFE, 0xFF];
+    for unit in "hello\n".encode_utf16() {
+        bytes.extend_from_slice(&unit.to_be_bytes());
+    }
+    fs::write(&path, bytes).unwrap();
+
+    let mut tab = EditorTab::new(100);
+    tab.open_file_async_with_auto_encoding_detection(path.clone())
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(result) = tab.poll_background_job() {
+            result.unwrap();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "async utf16be tab open timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(tab.encoding(), DocumentEncoding::utf16be());
+    assert_eq!(tab.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
+    assert_eq!(tab.text(), "hello\n");
+    assert!(!tab.can_preserve_save());
+    assert_eq!(
+        tab.preserve_save_error(),
+        Some(DocumentEncodingErrorKind::PreserveSaveUnsupported)
+    );
+
+    let status = tab.status();
+    assert_eq!(status.encoding(), DocumentEncoding::utf16be());
+    assert_eq!(status.encoding_origin(), DocumentEncodingOrigin::AutoDetected);
+    assert!(!status.decoding_had_errors());
+    assert_eq!(
+        status.preserve_save_error(),
+        Some(DocumentEncodingErrorKind::PreserveSaveUnsupported)
+    );
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tab_save_as_async_with_encoding_rejects_unrepresentable_conversion_without_starting_job() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-async-convert-reject-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("emoji-cp1251.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+
+    let mut tab = EditorTab::new(123);
+    let _ = tab
+        .document_mut()
+        .try_insert(TextPosition::new(0, 0), "emoji \u{1F642}\n")
+        .unwrap();
+
+    let err = tab.save_as_async_with_encoding(path.clone(), encoding).unwrap_err();
+    assert!(matches!(
+        err,
+        DocumentError::Encoding {
+            path: failed_path,
+            operation: "save",
+            encoding: failed_encoding,
+            reason: DocumentEncodingErrorKind::UnrepresentableText,
+        } if failed_path == path && failed_encoding == encoding
+    ));
+    assert!(!tab.is_saving());
+    assert!(tab.save_state().is_none());
+    assert!(tab.background_issue().is_none());
+    assert!(matches!(tab.background_activity(), BackgroundActivity::Idle));
+
     let _ = fs::remove_dir_all(&dir);
 }
 
