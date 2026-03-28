@@ -30,6 +30,13 @@ The same sidecar also stores persistent edit sessions: the current piece-tree
 state, add buffer, and undo/redo roots can be recovered automatically on the
 next `Document::open`, as long as the source file identity still matches.
 
+## Support Qem
+
+If Qem is useful to you and you want to support the project:
+
+- `USDT (0x address)`: `0x62c602d819dde8be07f1744b4e3b740ac0593982`
+- `BTC`: `bc1qhgft34j89vpsyggyljvg7rkzc7lh2yyk5w45k5`
+
 ## Highlights
 
 - Fast open and viewport reads for very large files

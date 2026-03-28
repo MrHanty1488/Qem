@@ -525,6 +525,56 @@ impl PieceTree {
             .flush_session(&self.history, self.history_index, add_bytes, meta)
     }
 
+    pub(crate) fn rebuild_history_roots_disk<F>(
+        &self,
+        source_path: &Path,
+        mut remap_piece: F,
+    ) -> io::Result<Self>
+    where
+        F: FnMut(Piece) -> io::Result<Vec<Piece>>,
+    {
+        let history_index = self.history_index.min(self.history.len().saturating_sub(1));
+        let mut remapped_history = Vec::with_capacity(self.history.len().max(1));
+        for entry in &self.history {
+            let mut pieces = Vec::new();
+            if let Some(root) = entry.root {
+                self.collect_pieces(root, &mut pieces);
+            }
+
+            let mut remapped_pieces = Vec::new();
+            for piece in pieces {
+                remapped_pieces.extend(remap_piece(piece)?);
+            }
+            remapped_history.push(remapped_pieces);
+        }
+
+        if remapped_history.is_empty() {
+            remapped_history.push(Vec::new());
+        }
+
+        let mut rebuilt = Self {
+            store: PageStore::Disk(DiskPageStore::create(source_path)?),
+            root: None,
+            history: Vec::with_capacity(remapped_history.len()),
+            history_index: history_index.min(remapped_history.len().saturating_sub(1)),
+            history_batch_depth: 0,
+            history_batch_dirty: false,
+        };
+
+        for pieces in remapped_history {
+            let root = rebuilt.build_tree_from_pieces(filter_zero_len(pieces));
+            rebuilt.history.push(RootEntry { root });
+        }
+
+        rebuilt.root = rebuilt
+            .history
+            .get(rebuilt.history_index)
+            .copied()
+            .unwrap_or(RootEntry { root: None })
+            .root;
+        Ok(rebuilt)
+    }
+
     pub(crate) fn replace_current_root_with_pieces(&mut self, pieces: Vec<Piece>) {
         let root = self.build_tree_from_pieces(filter_zero_len(pieces));
         self.root = root;

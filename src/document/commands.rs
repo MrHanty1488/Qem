@@ -1,6 +1,20 @@
 use super::*;
 
 impl Document {
+    fn clamp_raw_edit_line0_after_prepare(&self, line0: usize) -> usize {
+        line0.min(self.bounded_line_count().saturating_sub(1))
+    }
+
+    fn prepare_selection_for_edit(
+        &mut self,
+        selection: TextSelection,
+    ) -> Result<TextSelection, DocumentError> {
+        if self.selection_requires_piece_table_promotion(selection) {
+            self.promote_piece_table_to_rope()?;
+        }
+        Ok(self.clamp_selection(selection))
+    }
+
     /// Attempts to insert text at the given position and returns the new cursor coordinates.
     ///
     /// Passing an empty string is a no-op and keeps the document clean.
@@ -19,6 +33,7 @@ impl Document {
         }
 
         self.prepare_edit_at(line0)?;
+        let line0 = self.clamp_raw_edit_line0_after_prepare(line0);
         let doc_path = self.path.clone();
         if let Some(piece_table) = self.piece_table.as_mut() {
             let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
@@ -108,6 +123,7 @@ impl Document {
         }
 
         self.prepare_edit_at(line0)?;
+        let line0 = self.clamp_raw_edit_line0_after_prepare(line0);
 
         let doc_path = self.path.clone();
         if let Some(piece_table) = self.piece_table.as_mut() {
@@ -171,6 +187,7 @@ impl Document {
         }
 
         self.prepare_edit_at(line0)?;
+        let line0 = self.clamp_raw_edit_line0_after_prepare(line0);
 
         let doc_path = self.path.clone();
         if let Some(piece_table) = self.piece_table.as_mut() {
@@ -212,6 +229,7 @@ impl Document {
         selection: TextSelection,
         text: &str,
     ) -> Result<TextPosition, DocumentError> {
+        let selection = self.prepare_selection_for_edit(selection)?;
         self.try_replace(self.text_range_for_selection(selection), text)
     }
 
@@ -257,6 +275,7 @@ impl Document {
         col0: usize,
     ) -> Result<(bool, usize, usize), DocumentError> {
         self.prepare_edit_at(line0)?;
+        let line0 = self.clamp_raw_edit_line0_after_prepare(line0);
         let doc_path = self.path.clone();
         if let Some(piece_table) = self.piece_table.as_mut() {
             let path = session_sidecar_path(doc_path.as_deref(), piece_table.original.path());
@@ -316,7 +335,7 @@ impl Document {
         &mut self,
         selection: TextSelection,
     ) -> Result<EditResult, DocumentError> {
-        let selection = self.clamp_selection(selection);
+        let selection = self.prepare_selection_for_edit(selection)?;
         if selection.is_caret() {
             self.try_backspace(selection.head())
         } else {
@@ -407,7 +426,7 @@ impl Document {
         &mut self,
         selection: TextSelection,
     ) -> Result<EditResult, DocumentError> {
-        let selection = self.clamp_selection(selection);
+        let selection = self.prepare_selection_for_edit(selection)?;
         if selection.is_caret() {
             self.try_delete_forward(selection.head())
         } else {
@@ -422,7 +441,7 @@ impl Document {
         &mut self,
         selection: TextSelection,
     ) -> Result<EditResult, DocumentError> {
-        let selection = self.clamp_selection(selection);
+        let selection = self.prepare_selection_for_edit(selection)?;
         if selection.is_caret() {
             return Ok(EditResult::new(false, selection.head()));
         }
@@ -437,7 +456,7 @@ impl Document {
         &mut self,
         selection: TextSelection,
     ) -> Result<CutResult, DocumentError> {
-        let selection = self.clamp_selection(selection);
+        let selection = self.prepare_selection_for_edit(selection)?;
         if selection.is_caret() {
             return Ok(CutResult::new(
                 String::new(),

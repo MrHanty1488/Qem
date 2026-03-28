@@ -68,6 +68,40 @@ fn mmap_line_visible_bytes(
     &line_bytes[start..end]
 }
 
+fn trimmed_line_byte_range(bytes: &[u8], line_range: Option<(usize, usize)>) -> Option<(usize, usize)> {
+    let (start0, mut end0) = line_range?;
+    if end0 > bytes.len() {
+        end0 = bytes.len();
+    }
+    if start0 >= end0 {
+        return None;
+    }
+    if bytes[end0 - 1] == b'\n' {
+        end0 = end0.saturating_sub(1);
+    }
+    if end0 > start0 && bytes[end0 - 1] == b'\r' {
+        end0 = end0.saturating_sub(1);
+    }
+    (start0 < end0).then_some((start0, end0))
+}
+
+fn scanned_line_slice_is_exact(
+    bytes: &[u8],
+    line_range: (usize, usize),
+    start_col: usize,
+    max_cols: usize,
+    line_complete: bool,
+) -> bool {
+    if line_complete {
+        return true;
+    }
+    let Some((start0, end0)) = trimmed_line_byte_range(bytes, Some(line_range)) else {
+        return start_col == 0 && max_cols == 0;
+    };
+    let available_cols = count_text_columns_exact(&bytes[start0..end0]);
+    start_col <= available_cols && start_col.saturating_add(max_cols) <= available_cols
+}
+
 fn line_slice_from_bytes(
     bytes: &[u8],
     line_range: Option<(usize, usize)>,
@@ -85,7 +119,7 @@ fn line_slice_from_bytes(
 }
 
 #[derive(Clone, Copy, Debug)]
-struct MmapLineScan {
+pub(super) struct MmapLineScan {
     range: (usize, usize),
     complete: bool,
 }
@@ -112,7 +146,7 @@ struct LineSliceBatchRequest {
     max_cols: usize,
 }
 
-fn next_mmap_line_range(
+pub(super) fn next_mmap_line_range(
     bytes: &[u8],
     file_len: usize,
     start0: usize,
@@ -140,6 +174,71 @@ fn next_mmap_line_range(
         range: (start0, end0.max(start0)),
         complete: end0 < scan_end || scan_end == file_len,
     })
+}
+
+fn next_piece_table_scan_line_range(
+    bytes: &[u8],
+    start0: usize,
+    buffer_reaches_eof: bool,
+) -> Option<MmapLineScan> {
+    if start0 >= bytes.len() {
+        return None;
+    }
+
+    let slice = &bytes[start0..];
+    let end0 = if let Some(rel) = memchr::memchr2(b'\n', b'\r', slice) {
+        let idx = start0 + rel;
+        if bytes[idx] == b'\r' && idx + 1 < bytes.len() && bytes[idx + 1] == b'\n' {
+            idx + 2
+        } else {
+            idx + 1
+        }
+    } else {
+        bytes.len()
+    };
+
+    Some(MmapLineScan {
+        range: (start0, end0.max(start0)),
+        complete: end0 < bytes.len() || buffer_reaches_eof,
+    })
+}
+
+fn scanned_piece_table_offset_for_position(
+    piece_table: &PieceTable,
+    position: TextPosition,
+) -> Option<(usize, bool)> {
+    if piece_table.full_index() || position.line0() < piece_table.line_count() {
+        let actual_col0 = position.col0().min(piece_table.line_len_chars(position.line0()));
+        return Some((piece_table.byte_offset_for_col(position.line0(), actual_col0), true));
+    }
+
+    let scan_start = piece_table.known_byte_len.min(piece_table.total_len());
+    let scan_end = scan_start
+        .saturating_add(PARTIAL_PIECE_TABLE_SCAN_BYTES)
+        .min(piece_table.total_len());
+    if scan_start >= scan_end {
+        return None;
+    }
+
+    let bytes = piece_table.read_range(scan_start, scan_end);
+    let buffer_reaches_eof = scan_end == piece_table.total_len();
+    let mut rel_start = 0usize;
+    let mut skip_lines = position.line0().saturating_sub(piece_table.line_count());
+    while skip_lines > 0 {
+        let scanned = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
+        if scanned.range.1 <= rel_start || !scanned.complete {
+            return None;
+        }
+        rel_start = scanned.range.1;
+        skip_lines -= 1;
+    }
+
+    let scanned = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
+    let offset = byte_offset_for_text_col_in_bytes(&bytes, scanned.range, position.col0());
+    Some((
+        scan_start.saturating_add(offset),
+        Document::piece_table_position_is_representable(piece_table, position),
+    ))
 }
 
 pub(super) fn trailing_mmap_line_ranges(
@@ -214,6 +313,29 @@ impl ExactSizeIterator for Lines<'_> {}
 impl FusedIterator for Lines<'_> {}
 
 impl Document {
+    fn read_position_is_exact(&self, position: TextPosition) -> bool {
+        if self.rope.is_some() {
+            return true;
+        }
+
+        if let Some(piece_table) = &self.piece_table {
+            return Self::piece_table_position_is_representable(piece_table, position);
+        }
+
+        let bytes = self.mmap_bytes();
+        let file_len = self.file_len.min(bytes.len());
+        if file_len == 0 {
+            return true;
+        }
+
+        let indexing_complete = self.is_fully_indexed();
+        let offsets_guard = self.line_offsets.try_read().ok();
+        let offsets: Option<&LineOffsets> = offsets_guard.as_deref();
+        self.resolve_mmap_line_range(position.line0(), file_len, offsets, indexing_complete)
+            .map(|resolved| resolved.exact)
+            .unwrap_or(false)
+    }
+
     fn line_slice_from_rope_backing(
         rope: &Rope,
         line0: usize,
@@ -256,7 +378,14 @@ impl Document {
                 true,
             ));
         }
-        None
+        Self::line_slices_from_partial_piece_table_backing(
+            piece_table,
+            line0,
+            1,
+            start_col,
+            max_cols,
+        )
+        .and_then(|mut slices| slices.pop())
     }
 
     fn resolve_mmap_line_range(
@@ -282,6 +411,14 @@ impl Document {
         start_col: usize,
         max_cols: usize,
     ) -> LineSlice {
+        if self
+            .line_count()
+            .exact()
+            .is_some_and(|total_lines| line0 >= total_lines)
+        {
+            return LineSlice::new(String::new(), true);
+        }
+
         let bytes = self.mmap_bytes();
         let file_len = self.file_len.min(bytes.len());
         if bytes.is_empty() || file_len == 0 {
@@ -290,6 +427,24 @@ impl Document {
             } else {
                 LineSlice::default()
             };
+        }
+        if let Some(start0) = self.mmap_line_start_offset_exact(line0) {
+            if start0 >= file_len {
+                return LineSlice::new(String::new(), true);
+            }
+            if let Some(scanned) =
+                next_mmap_line_range(bytes, file_len, start0, FALLBACK_NEXT_LINE_SCAN_BYTES)
+            {
+                if scanned.complete {
+                    return line_slice_from_bytes(
+                        bytes,
+                        Some(scanned.range),
+                        start_col,
+                        max_cols,
+                        true,
+                    );
+                }
+            }
         }
 
         let indexing_complete = self.is_fully_indexed();
@@ -342,9 +497,100 @@ impl Document {
             return piece_table.line_slices_exact(first_line0, line_count, start_col, max_cols);
         }
 
-        (0..line_count)
-            .map(|offset| self.line_slice(first_line0.saturating_add(offset), start_col, max_cols))
-            .collect()
+        let exact_available = piece_table.line_count().saturating_sub(first_line0).min(line_count);
+        let mut slices = if exact_available > 0 {
+            piece_table.line_slices_exact(first_line0, exact_available, start_col, max_cols)
+        } else {
+            Vec::new()
+        };
+
+        let remaining = line_count.saturating_sub(slices.len());
+        if remaining > 0 {
+            let scan_start_line0 = first_line0.saturating_add(slices.len());
+            if let Some(mut scanned) = Self::line_slices_from_partial_piece_table_backing(
+                piece_table,
+                scan_start_line0,
+                remaining,
+                start_col,
+                max_cols,
+            ) {
+                slices.append(&mut scanned);
+            }
+        }
+
+        slices.resize(line_count, LineSlice::default());
+        slices
+    }
+
+    fn line_slices_from_partial_piece_table_backing(
+        piece_table: &PieceTable,
+        first_line0: usize,
+        line_count: usize,
+        start_col: usize,
+        max_cols: usize,
+    ) -> Option<Vec<LineSlice>> {
+        if line_count == 0 || first_line0 < piece_table.line_count() {
+            return Some(Vec::new());
+        }
+
+        let scan_start = piece_table.known_byte_len.min(piece_table.total_len());
+        let scan_end = scan_start
+            .saturating_add(PARTIAL_PIECE_TABLE_SCAN_BYTES)
+            .min(piece_table.total_len());
+        if scan_start >= scan_end {
+            return Some(Vec::new());
+        }
+
+        let bytes = piece_table.read_range(scan_start, scan_end);
+        let buffer_reaches_eof = scan_end == piece_table.total_len();
+        let mut rel_start = 0usize;
+        let mut skip_lines = first_line0.saturating_sub(piece_table.line_count());
+        while skip_lines > 0 {
+            let scanned =
+                next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
+            if scanned.range.1 <= rel_start {
+                return None;
+            }
+            rel_start = scanned.range.1;
+            skip_lines -= 1;
+            if !scanned.complete {
+                return None;
+            }
+        }
+
+        let mut slices = Vec::with_capacity(line_count);
+        while slices.len() < line_count {
+            if rel_start >= bytes.len() {
+                if buffer_reaches_eof && matches!(bytes.last().copied(), Some(b'\n' | b'\r')) {
+                    slices.push(LineSlice::new(String::new(), true));
+                }
+                break;
+            }
+
+            let scanned = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
+            if scanned.range.1 <= rel_start {
+                break;
+            }
+            slices.push(line_slice_from_bytes(
+                &bytes,
+                Some(scanned.range),
+                start_col,
+                max_cols,
+                scanned_line_slice_is_exact(
+                    &bytes,
+                    scanned.range,
+                    start_col,
+                    max_cols,
+                    scanned.complete,
+                ),
+            ));
+            rel_start = scanned.range.1;
+            if !scanned.complete {
+                break;
+            }
+        }
+
+        Some(slices)
     }
 
     fn tail_estimated_mmap_line_slices(
@@ -460,6 +706,15 @@ impl Document {
         start_col: usize,
         max_cols: usize,
     ) -> Vec<LineSlice> {
+        if line_count == 1 && self.mmap_line_start_offset_exact(first_line0).is_some() {
+            return vec![self.line_slice_from_mmap_backing(first_line0, start_col, max_cols)];
+        }
+
+        let exact_total_lines = self.line_count().exact();
+        if exact_total_lines.is_some_and(|total_lines| first_line0 >= total_lines) {
+            return vec![LineSlice::new(String::new(), true); line_count];
+        }
+
         let bytes = self.mmap_bytes();
         let file_len = self.file_len.min(bytes.len());
         if bytes.is_empty() || file_len == 0 {
@@ -493,6 +748,12 @@ impl Document {
             self.collect_exact_mmap_line_slices(ctx, request);
         self.extend_estimated_mmap_line_slices(&mut slices, ctx, request, next_line0, scan_start);
         slices.resize(line_count, LineSlice::default());
+        if let Some(total_lines) = exact_total_lines {
+            let first_oob = total_lines.saturating_sub(first_line0).min(line_count);
+            for slice in &mut slices[first_oob..] {
+                *slice = LineSlice::new(String::new(), true);
+            }
+        }
         slices
     }
 
@@ -512,15 +773,24 @@ impl Document {
     }
 
     fn read_text_from_piece_table_backing(
+        &self,
         piece_table: &PieceTable,
         start: TextPosition,
         len_chars: usize,
     ) -> TextSlice {
-        let start_col0 = start.col0().min(piece_table.line_len_chars(start.line0()));
-        let start_offset = piece_table.byte_offset_for_col(start.line0(), start_col0);
+        let Some((start_offset, exact_start)) =
+            scanned_piece_table_offset_for_position(piece_table, start)
+        else {
+            return TextSlice::new(String::new(), false);
+        };
         let end_offset = piece_table.advance_offset_by_text_units(start_offset, len_chars);
+        let end = piece_table.position_for_byte_offset_from(start_offset, start, end_offset);
+        let exact_end = self.read_position_is_exact(end);
         let bytes = piece_table.read_range(start_offset, end_offset);
-        TextSlice::new(String::from_utf8_lossy(&bytes).into_owned(), true)
+        TextSlice::new(
+            String::from_utf8_lossy(&bytes).into_owned(),
+            exact_start && exact_end,
+        )
     }
 
     fn read_text_from_mmap_backing(&self, start: TextPosition, len_chars: usize) -> TextSlice {
@@ -530,32 +800,27 @@ impl Document {
             return TextSlice::new(String::new(), true);
         }
 
-        let indexing_complete = self.is_fully_indexed();
-        let offsets_guard = self.line_offsets.try_read().ok();
-        let offsets: Option<&LineOffsets> = offsets_guard.as_deref();
-        let Some(resolved) =
-            self.resolve_mmap_line_range(start.line0(), file_len, offsets, indexing_complete)
-        else {
-            return TextSlice::new(String::new(), false);
-        };
+        let precise_start_offset = self.mmap_byte_offset_for_position(start).min(file_len);
+        let exact_start = self.mmap_position_for_byte_offset(precise_start_offset) == start;
+        if precise_start_offset >= file_len {
+            return TextSlice::new(String::new(), exact_start);
+        }
 
-        let start_offset = byte_offset_for_text_col_in_bytes(bytes, resolved.range, start.col0());
         let end_offset =
-            advance_offset_by_text_units_in_bytes(bytes, file_len, start_offset, len_chars);
-        let text =
-            String::from_utf8_lossy(&bytes[start_offset.min(file_len)..end_offset]).into_owned();
-        TextSlice::new(text, resolved.exact)
+            advance_offset_by_text_units_in_bytes(bytes, file_len, precise_start_offset, len_chars);
+        let text = String::from_utf8_lossy(&bytes[precise_start_offset..end_offset]).into_owned();
+        TextSlice::new(text, exact_start)
     }
 
     /// Returns a lazy iterator over the currently known document lines.
     ///
-    /// While mmap indexing is still in progress this follows [`Document::line_count`],
-    /// which is a safe lower bound until indexing completes.
+    /// While mmap indexing is still in progress this follows the currently
+    /// known lower bound instead of scrollbar-oriented line-count estimates.
     pub fn lines(&self) -> impl ExactSizeIterator<Item = LineSlice> + FusedIterator + '_ {
         Lines {
             doc: self,
             next_line: 0,
-            total_lines: self.display_line_count(),
+            total_lines: self.bounded_line_count(),
         }
     }
 
@@ -565,10 +830,6 @@ impl Document {
     /// the method may return a heuristic slice and mark it via
     /// [`LineSlice::is_exact`].
     pub fn line_slice(&self, line0: usize, start_col: usize, max_cols: usize) -> LineSlice {
-        if max_cols == 0 {
-            return LineSlice::default();
-        }
-
         if let Some(rope) = &self.rope {
             return Self::line_slice_from_rope_backing(rope, line0, start_col, max_cols);
         }
@@ -579,6 +840,7 @@ impl Document {
             {
                 return slice;
             }
+            return LineSlice::default();
         }
 
         self.line_slice_from_mmap_backing(line0, start_col, max_cols)
@@ -598,9 +860,6 @@ impl Document {
     ) -> Vec<LineSlice> {
         if line_count == 0 {
             return Vec::new();
-        }
-        if max_cols == 0 {
-            return vec![LineSlice::default(); line_count];
         }
 
         if let Some(rope) = &self.rope {
@@ -638,7 +897,14 @@ impl Document {
     pub fn read_text(&self, range: TextRange) -> TextSlice {
         let start = self.clamp_position(range.start());
         if range.is_empty() {
-            return TextSlice::new(String::new(), true);
+            if self.rope.is_some() || self.piece_table.is_some() {
+                return TextSlice::new(String::new(), self.read_position_is_exact(start));
+            }
+
+            let file_len = self.file_len.min(self.mmap_bytes().len());
+            let start_offset = self.mmap_byte_offset_for_position(start).min(file_len);
+            let exact = self.mmap_position_for_byte_offset(start_offset) == start;
+            return TextSlice::new(String::new(), exact);
         }
 
         if let Some(rope) = &self.rope {
@@ -646,7 +912,7 @@ impl Document {
         }
 
         if let Some(piece_table) = &self.piece_table {
-            return Self::read_text_from_piece_table_backing(piece_table, start, range.len_chars());
+            return self.read_text_from_piece_table_backing(piece_table, start, range.len_chars());
         }
 
         self.read_text_from_mmap_backing(start, range.len_chars())
@@ -654,7 +920,20 @@ impl Document {
 
     /// Reads the current selection as a typed text slice.
     pub fn read_selection(&self, selection: TextSelection) -> TextSlice {
-        self.read_text(self.text_range_for_selection(selection))
+        let selection = self.clamp_selection(selection);
+        let piece_table_endpoints_exact = self
+            .piece_table
+            .as_ref()
+            .map(|_| {
+                self.read_position_is_exact(selection.anchor())
+                    && self.read_position_is_exact(selection.head())
+            })
+            .unwrap_or(true);
+        let slice = self.read_text(self.text_range_for_selection(selection));
+        if !piece_table_endpoints_exact || self.selection_requires_piece_table_promotion(selection) {
+            return TextSlice::new(slice.into_text(), false);
+        }
+        slice
     }
 
     /// Reads a viewport using a typed request/response model.

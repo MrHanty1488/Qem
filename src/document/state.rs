@@ -212,7 +212,7 @@ impl Document {
     }
 
     /// Returns the line count without heuristic extrapolation from average line length.
-    fn bounded_line_count(&self) -> usize {
+    pub(super) fn bounded_line_count(&self) -> usize {
         if let Some(piece_table) = &self.piece_table {
             return piece_table.line_count().max(1);
         }
@@ -400,6 +400,20 @@ impl Document {
         self.decoding_had_errors && !(self.encoding.is_utf8() && self.rope.is_none())
     }
 
+    fn save_reopen_size_error(
+        &self,
+        encoding: DocumentEncoding,
+        encoded_len: usize,
+    ) -> Option<DocumentEncodingErrorKind> {
+        let reload_after_save = !self.has_edit_buffer() || self.has_piece_table();
+        (reload_after_save
+            && !encoding.is_utf8()
+            && encoded_len > MAX_ROPE_EDIT_FILE_BYTES)
+            .then_some(DocumentEncodingErrorKind::SaveReopenTooLarge {
+                max_bytes: MAX_ROPE_EDIT_FILE_BYTES,
+            })
+    }
+
     fn rendered_text_for_save_validation(&self) -> String {
         if let Some(rope) = &self.rope {
             return rope_text_with_line_endings(rope, self.line_ending);
@@ -424,7 +438,10 @@ impl Document {
             None
         } else {
             let rendered = self.rendered_text_for_save_validation();
-            encode_text_with_encoding(&rendered, self.encoding).err()
+            match encode_text_with_encoding(&rendered, self.encoding) {
+                Ok(bytes) => self.save_reopen_size_error(self.encoding, bytes.len()),
+                Err(err) => Some(err),
+            }
         };
 
         self.preserve_save_error_cache.set(Some(computed));
@@ -448,7 +465,10 @@ impl Document {
             SaveEncodingPolicy::Preserve => self.preserve_save_error(),
             SaveEncodingPolicy::Convert(encoding) => {
                 let rendered = self.rendered_text_for_save_validation();
-                encode_text_with_encoding(&rendered, encoding).err()
+                match encode_text_with_encoding(&rendered, encoding) {
+                    Ok(bytes) => self.save_reopen_size_error(encoding, bytes.len()),
+                    Err(err) => Some(err),
+                }
             }
         }
     }

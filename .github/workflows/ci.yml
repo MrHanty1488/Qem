@@ -4,6 +4,7 @@ on:
   push:
     branches: ["master", "main"]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,8 +29,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test --all-features
-        run: cargo test --all-features
+      - name: cargo test --quiet --all-features
+        run: cargo test --quiet --all-features
+
+  linux-stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PROPTEST_CASES: "128"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: randomized_piece_table_recovery_and_history_roundtrip
+        run: cargo test --quiet randomized_piece_table_recovery_and_history_roundtrip
+      - name: randomized_piece_table_save_to_clears_sessions_and_reopens_clean
+        run: cargo test --quiet randomized_piece_table_save_to_clears_sessions_and_reopens_clean
+      - name: randomized_small_file_roundtrip_matches_model
+        run: cargo test --quiet randomized_small_file_roundtrip_matches_model
 
   feature-matrix:
     runs-on: ubuntu-latest
@@ -64,8 +81,8 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: cargo clippy
-        run: cargo clippy --all-features --all-targets -- -D warnings
+      - name: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
       - name: cargo doc
         run: cargo doc --all-features --no-deps
 

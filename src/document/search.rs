@@ -84,7 +84,7 @@ fn advance_position_by_bytes(start: TextPosition, bytes: &[u8]) -> TextPosition 
     state.position()
 }
 
-fn next_line_start_exact(bytes: &[u8], file_len: usize, line_start: usize) -> usize {
+pub(super) fn next_line_start_exact(bytes: &[u8], file_len: usize, line_start: usize) -> usize {
     let line_start = line_start.min(file_len);
     if line_start >= file_len {
         return file_len;
@@ -100,6 +100,79 @@ fn next_line_start_exact(bytes: &[u8], file_len: usize, line_start: usize) -> us
     } else {
         idx + 1
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PieceTableLineScan {
+    range: (usize, usize),
+    complete: bool,
+}
+
+fn next_piece_table_scan_line_range(
+    bytes: &[u8],
+    start0: usize,
+    buffer_reaches_eof: bool,
+) -> Option<PieceTableLineScan> {
+    if start0 >= bytes.len() {
+        return None;
+    }
+
+    let slice = &bytes[start0..];
+    let end0 = if let Some(rel) = memchr::memchr2(b'\n', b'\r', slice) {
+        let idx = start0 + rel;
+        if bytes[idx] == b'\r' && idx + 1 < bytes.len() && bytes[idx + 1] == b'\n' {
+            idx + 2
+        } else {
+            idx + 1
+        }
+    } else {
+        bytes.len()
+    };
+
+    Some(PieceTableLineScan {
+        range: (start0, end0.max(start0)),
+        complete: end0 < bytes.len() || buffer_reaches_eof,
+    })
+}
+
+fn scanned_piece_table_byte_offset_for_position(
+    piece_table: &PieceTable,
+    position: TextPosition,
+) -> Option<usize> {
+    if piece_table.full_index() || position.line0() < piece_table.line_count() {
+        let actual_col0 = position.col0().min(piece_table.line_len_chars(position.line0()));
+        return Some(piece_table.byte_offset_for_col(position.line0(), actual_col0));
+    }
+
+    let scan_start = piece_table.known_byte_len.min(piece_table.total_len());
+    let scan_end = scan_start
+        .saturating_add(PARTIAL_PIECE_TABLE_SCAN_BYTES)
+        .min(piece_table.total_len());
+    if scan_start >= scan_end {
+        return None;
+    }
+
+    let bytes = piece_table.read_range(scan_start, scan_end);
+    let buffer_reaches_eof = scan_end == piece_table.total_len();
+    let mut rel_start = 0usize;
+    let mut skip_lines = position.line0().saturating_sub(piece_table.line_count());
+    while skip_lines > 0 {
+        let scanned = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
+        if scanned.range.1 <= rel_start || !scanned.complete {
+            return None;
+        }
+        rel_start = scanned.range.1;
+        skip_lines -= 1;
+    }
+
+    let range = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
+    Some(
+        scan_start.saturating_add(byte_offset_for_text_col_in_bytes(
+            &bytes,
+            range.range,
+            position.col0(),
+        )),
+    )
 }
 
 fn line_offsets_anchor_for_line(offsets: &LineOffsets, line0: usize) -> (usize, usize) {
@@ -290,9 +363,10 @@ impl Iterator for LiteralSearchIter<'_> {
                 self.finished = true;
                 return None;
             }
-            let rel = query
-                .finder
-                .find(&buffered.bytes[buffered.next_rel_offset..])?;
+            let Some(rel) = query.finder.find(&buffered.bytes[buffered.next_rel_offset..]) else {
+                self.finished = true;
+                return None;
+            };
             let match_start_rel = buffered.next_rel_offset.saturating_add(rel);
             let start_pos = if match_start_rel == buffered.next_rel_offset {
                 self.next_from
@@ -326,7 +400,7 @@ impl Iterator for LiteralSearchIter<'_> {
                 &query.finder,
                 (self.next_from, self.next_offset),
                 (end, end_offset),
-            )?
+            )
         } else {
             self.doc.find_next_with_offset_hint(
                 query.bytes(),
@@ -334,13 +408,19 @@ impl Iterator for LiteralSearchIter<'_> {
                 &query.finder,
                 self.next_from,
                 self.next_offset,
-            )?
+            )
+        };
+        let Some(found) = found else {
+            self.finished = true;
+            return None;
         };
         self.next_offset = found.1;
         self.next_from = found.0.end();
         Some(found.0)
     }
 }
+
+impl std::iter::FusedIterator for LiteralSearchIter<'_> {}
 
 impl Document {
     /// Finds the next literal match starting at `from`.
@@ -748,6 +828,8 @@ impl Document {
 
         if let Some(piece_table) = &self.piece_table {
             let start_offset = piece_table.byte_offset_for_col(start.line0(), start.col0());
+            let start_offset =
+                scanned_piece_table_byte_offset_for_position(piece_table, start).unwrap_or(start_offset);
             let end_offset =
                 piece_table.advance_offset_by_text_units(start_offset, range.len_chars());
             let end = piece_table.position_for_byte_offset_from(start_offset, start, end_offset);
@@ -943,7 +1025,8 @@ impl Document {
     ) -> Option<SearchMatch> {
         let start_col0 = from.col0();
         let start_pos = TextPosition::new(from.line0(), start_col0);
-        let start_offset = piece_table.byte_offset_for_col(from.line0(), start_col0);
+        let start_offset = scanned_piece_table_byte_offset_for_position(piece_table, start_pos)
+            .unwrap_or_else(|| piece_table.byte_offset_for_col(from.line0(), start_col0));
         let (start_pos, _) = piece_table.find_literal_next_from_position(
             start_offset,
             start_pos,
@@ -992,7 +1075,19 @@ impl Document {
         before: TextPosition,
     ) -> Option<SearchMatch> {
         let mut search_before = before;
-        let mut end_offset = piece_table.byte_offset_for_col(before.line0(), before.col0());
+        let mut end_offset = if let Some(offset) =
+            scanned_piece_table_byte_offset_for_position(piece_table, before)
+        {
+            offset
+        } else {
+            // For unresolved positions past the indexed/scannable prefix we must
+            // not widen reverse search to EOF. That can return matches after the
+            // caller's logical `before` position, so fall back to the last known
+            // safe boundary instead.
+            let fallback = piece_table.known_byte_len.min(piece_table.total_len);
+            search_before = piece_table.position_for_byte_offset(fallback);
+            fallback
+        };
         if memchr::memchr2(b'\n', b'\r', needle).is_none() {
             if let Some((adjusted_before, adjusted_end_offset)) =
                 piece_table.prev_search_anchor_before_trailing_newline(before, end_offset)
@@ -1012,7 +1107,33 @@ impl Document {
         ))
     }
 
-    fn mmap_byte_offset_for_position(&self, position: TextPosition) -> usize {
+    pub(super) fn mmap_line_start_offset_exact(&self, target_line0: usize) -> Option<usize> {
+        let bytes = self.mmap_bytes();
+        let file_len = self.file_len.min(bytes.len());
+        if file_len == 0 {
+            return (target_line0 == 0).then_some(0);
+        }
+
+        let mut line0 = 0usize;
+        let mut line_start = 0usize;
+        if let Ok(offsets) = self.line_offsets.read() {
+            (line0, line_start) = line_offsets_anchor_for_line(&offsets, target_line0);
+            line_start = line_start.min(file_len);
+        }
+
+        while line0 < target_line0 && line_start < file_len {
+            let next = next_line_start_exact(bytes, file_len, line_start);
+            if next <= line_start {
+                break;
+            }
+            line_start = next;
+            line0 += 1;
+        }
+
+        (line0 == target_line0).then_some(line_start)
+    }
+
+    pub(super) fn mmap_byte_offset_for_position(&self, position: TextPosition) -> usize {
         let position = self.clamp_position(position);
         let bytes = self.mmap_bytes();
         let file_len = self.file_len.min(bytes.len());
@@ -1041,7 +1162,7 @@ impl Document {
             .min(file_len)
     }
 
-    fn mmap_position_for_byte_offset(&self, byte_offset: usize) -> TextPosition {
+    pub(super) fn mmap_position_for_byte_offset(&self, byte_offset: usize) -> TextPosition {
         let bytes = self.mmap_bytes();
         let file_len = self.file_len.min(bytes.len());
         let target = byte_offset.min(file_len);
@@ -1132,7 +1253,8 @@ impl Document {
             return rope.char_to_byte(char_index);
         }
         if let Some(piece_table) = &self.piece_table {
-            return piece_table.byte_offset_for_col(position.line0(), position.col0());
+            return scanned_piece_table_byte_offset_for_position(piece_table, position)
+                .unwrap_or_else(|| piece_table.byte_offset_for_col(position.line0(), position.col0()));
         }
         self.mmap_byte_offset_for_position(position)
     }
@@ -1259,7 +1381,7 @@ impl PieceTable {
         state.position()
     }
 
-    fn position_for_byte_offset_from(
+    pub(crate) fn position_for_byte_offset_from(
         &self,
         anchor_offset: usize,
         anchor_position: TextPosition,

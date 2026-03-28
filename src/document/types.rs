@@ -802,9 +802,9 @@ impl ByteProgress {
     /// Returns completion as a `0.0..=1.0` fraction.
     pub fn fraction(self) -> f32 {
         if self.total_bytes == 0 {
-            0.0
+            1.0
         } else {
-            self.completed_bytes as f32 / self.total_bytes as f32
+            self.completed_bytes.min(self.total_bytes) as f32 / self.total_bytes as f32
         }
     }
 }
@@ -1160,6 +1160,9 @@ impl DocumentMaintenanceStatus {
 pub enum DocumentEncodingErrorKind {
     /// Opening this encoding would require a full transcode beyond the current safety limit.
     OpenTranscodeTooLarge { max_bytes: usize },
+    /// Saving to this encoding would succeed, but reopening the saved document
+    /// would require a full transcode beyond the current safety limit.
+    SaveReopenTooLarge { max_bytes: usize },
     /// Preserving the current decoded encoding contract is not supported on save yet.
     PreserveSaveUnsupported,
     /// Preserving the current decoded encoding would cement a lossy open.
@@ -1178,6 +1181,10 @@ impl std::fmt::Display for DocumentEncodingErrorKind {
             Self::OpenTranscodeTooLarge { max_bytes } => write!(
                 f,
                 "non-UTF8 open currently requires full transcoding and is limited to {max_bytes} bytes"
+            ),
+            Self::SaveReopenTooLarge { max_bytes } => write!(
+                f,
+                "saving to this non-UTF8 target would require reopening a full transcoded buffer and is limited to {max_bytes} bytes"
             ),
             Self::PreserveSaveUnsupported => f.write_str(
                 "preserve-save is not yet supported for this encoding; use DocumentSaveOptions::with_encoding(...) to convert to a supported target",

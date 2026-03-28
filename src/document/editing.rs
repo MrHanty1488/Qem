@@ -215,6 +215,7 @@ impl Document {
     }
 
     pub(super) fn rope_line_len_chars_without_newline(rope: &Rope, line0: usize) -> usize {
+        let line0 = line0.min(rope.len_lines().saturating_sub(1));
         let line = rope.line(line0);
         let mut len = line.len_chars();
         if len > 0 && line.char(len - 1) == '\n' {

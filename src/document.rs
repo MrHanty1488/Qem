@@ -722,6 +722,20 @@ fn count_text_columns(bytes: &[u8], max_cols: usize) -> usize {
     cols
 }
 
+#[inline]
+fn count_text_columns_exact(bytes: &[u8]) -> usize {
+    let mut cols = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'\n' | b'\r') {
+            break;
+        }
+        i += utf8_step(bytes, i, bytes.len());
+        cols += 1;
+    }
+    cols
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CursorScanState {
     target: usize,
@@ -1242,14 +1256,14 @@ impl PieceTable {
         let mut done = false;
         self.pieces
             .visit_range(start, end, |piece, local_start, local_end| {
-                if done || col >= MAX_LINE_SCAN_CHARS {
+                if done {
                     return;
                 }
                 let seg_start = piece.start + local_start;
                 let seg_end = piece.start + local_end;
                 let src = self.source_bytes(piece.src);
                 let mut i = seg_start;
-                while i < seg_end && col < MAX_LINE_SCAN_CHARS {
+                while i < seg_end {
                     let b = src[i];
                     if b == b'\n' || b == b'\r' {
                         done = true;
@@ -1260,7 +1274,7 @@ impl PieceTable {
                     i += step;
                 }
             });
-        col.min(MAX_LINE_SCAN_CHARS)
+        col
     }
 
     pub(crate) fn line_visible_segment(

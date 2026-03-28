@@ -3,13 +3,15 @@ use super::{
     SaveError,
 };
 use crate::{
-    CompactionPolicy, CompactionUrgency, DocumentBacking, DocumentEncoding,
+    CompactionPolicy, CompactionUrgency, Document, DocumentBacking, DocumentEncoding,
     DocumentEncodingErrorKind, DocumentEncodingOrigin, DocumentError, EditCapability,
     IdleCompactionOutcome, LiteralSearchQuery, MaintenanceAction, TextPosition, TextSelection,
     ViewportRequest,
 };
 use encoding_rs::{GB18030, SHIFT_JIS, WINDOWS_1251};
 use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -45,6 +47,15 @@ fn save_async_completes_and_clears_dirty_flag() {
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_progress_fraction_treats_empty_or_overreported_work_as_complete() {
+    let empty = super::FileProgress::new(Arc::new(PathBuf::from("empty.txt")), 0, 0);
+    assert_eq!(empty.fraction(), 1.0);
+
+    let overreported = super::FileProgress::new(Arc::new(PathBuf::from("full.txt")), 12, 10);
+    assert_eq!(overreported.fraction(), 1.0);
 }
 
 #[test]
@@ -467,6 +478,48 @@ fn session_and_tab_save_conversion_preflight_reports_success_and_failures() {
         ),
         Some(DocumentEncodingErrorKind::UnsupportedSaveTarget)
     );
+}
+
+#[test]
+fn session_and_tab_large_non_utf8_save_preflight_report_reopen_limit() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-large-save-preflight-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("huge-source.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+
+    let mut file = fs::File::create(&path).unwrap();
+    use std::io::Write as _;
+    file.write_all(b"line\n").unwrap();
+    file.set_len((128 * 1024 * 1024 + 1) as u64).unwrap();
+    drop(file);
+
+    let mut session = DocumentSession::new();
+    session.open_file(path.clone()).unwrap();
+    let _ = session.try_insert(TextPosition::new(0, 0), "X").unwrap();
+    assert_eq!(
+        session.save_error_for_encoding(encoding),
+        Some(DocumentEncodingErrorKind::SaveReopenTooLarge {
+            max_bytes: 128 * 1024 * 1024,
+        })
+    );
+    assert!(!session.can_save_with_encoding(encoding));
+
+    let mut tab = EditorTab::new(701);
+    tab.open_file(path.clone()).unwrap();
+    let _ = tab.try_insert(TextPosition::new(0, 0), "X").unwrap();
+    assert_eq!(
+        tab.save_error_for_encoding(encoding),
+        Some(DocumentEncodingErrorKind::SaveReopenTooLarge {
+            max_bytes: 128 * 1024 * 1024,
+        })
+    );
+    assert!(!tab.can_save_with_encoding(encoding));
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -1189,6 +1242,130 @@ fn editor_tab_repeated_save_as_async_keeps_first_job_authoritative() {
 }
 
 #[test]
+fn session_sync_save_rejects_when_async_save_is_in_progress() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-session-sync-save-guard-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("guard.txt");
+    let original = b"abc\ndef\n".repeat((1024 * 1024 / 8) + 1);
+    fs::write(&path, &original).unwrap();
+
+    let mut session = DocumentSession::new();
+    session.open_file(path.clone()).unwrap();
+    let _ = session.try_insert(TextPosition::new(0, 0), "123").unwrap();
+
+    assert!(session.save_async().unwrap());
+    assert!(session.is_saving());
+
+    let err = session.save().unwrap_err();
+    assert!(matches!(err, SaveError::InProgress));
+    assert!(session.is_saving());
+    assert!(session.is_dirty());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(result) = session.poll_background_job() {
+            result.unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline, "session async save guard timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(!session.is_saving());
+    assert!(!session.is_dirty());
+    assert!(fs::read(&path).unwrap().starts_with(b"123abc\ndef\n"));
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_sync_save_as_same_path_preserve_is_clean_noop() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-session-sync-save-as-noop-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("clean.txt");
+    fs::write(&path, b"alpha\nbeta\n").unwrap();
+
+    let mut session = DocumentSession::new();
+    session.open_file(path.clone()).unwrap();
+    let generation = session.generation();
+    let before = fs::read(&path).unwrap();
+
+    session.save_as(path.clone()).unwrap();
+
+    assert_eq!(session.generation(), generation);
+    assert_eq!(session.current_path(), Some(path.as_path()));
+    assert!(!session.is_dirty());
+    assert_eq!(fs::read(&path).unwrap(), before);
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tab_sync_save_as_rejects_when_async_save_is_in_progress() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-tab-sync-save-as-guard-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("source.txt");
+    let output_a = dir.join("a.txt");
+    let output_b = dir.join("b.txt");
+    let original = b"abc\ndef\n".repeat((1024 * 1024 / 8) + 1);
+    fs::write(&path, &original).unwrap();
+
+    let mut tab = EditorTab::new(118);
+    tab.open_file(path.clone()).unwrap();
+    let _ = tab.try_insert(TextPosition::new(0, 0), "123").unwrap();
+
+    assert!(tab.save_as_async(output_a.clone()).unwrap());
+    assert!(tab.is_saving());
+
+    let err = tab.save_as(output_b.clone()).unwrap_err();
+    assert!(matches!(
+        err,
+        crate::DocumentError::Write {
+            path,
+            ref source,
+        } if path == output_b && source.to_string() == "save already in progress"
+    ));
+    assert_eq!(
+        tab.save_state()
+            .expect("first async save should remain authoritative")
+            .path(),
+        output_a.as_path()
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(result) = tab.poll_background_job() {
+            result.unwrap();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tab async save-as guard timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(tab.current_path(), Some(output_a.as_path()));
+    assert!(fs::read(&output_a).unwrap().starts_with(b"123abc\ndef\n"));
+    assert!(!output_b.exists());
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&output_a);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn editor_tab_close_file_while_async_save_defers_until_completion() {
     let dir = std::env::temp_dir().join(format!("qem-editor-close-save-{}", std::process::id()));
     let _ = fs::create_dir_all(&dir);
@@ -1434,6 +1611,253 @@ fn editor_tab_document_mut_during_async_save_discards_stale_save_result() {
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_file(&output);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn same_path_async_save_discard_keeps_recovery_usable_after_manual_flush() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-same-path-discard-recovery-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("source.txt");
+    let original = b"abc\ndef\n".repeat((1024 * 1024 / 8) + 1);
+    fs::write(&path, &original).unwrap();
+
+    let mut tab = EditorTab::new(220);
+    tab.open_file(path.clone()).unwrap();
+    let _ = tab.try_insert(TextPosition::new(0, 0), "123").unwrap();
+    assert!(tab.document().has_piece_table());
+
+    assert!(tab.save_async().unwrap());
+    let _ = tab
+        .document_mut()
+        .try_insert_text_at(0, 0, "Z")
+        .expect("raw document edit should still work");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let err = loop {
+        if let Some(result) = tab.poll_background_job() {
+            break result.unwrap_err();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "same-path discard recovery test timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    assert!(matches!(
+        err,
+        crate::DocumentError::Write {
+            path: failed_path,
+            ref source,
+        } if failed_path == path
+            && source.to_string() == "background save result discarded after current session state changed"
+    ));
+    tab.document_mut().flush_session().unwrap();
+
+    let mut reopened = Document::open(path.clone()).unwrap();
+    assert!(
+        reopened.is_dirty(),
+        "same-path discard should still leave a recoverable dirty session after flush"
+    );
+    assert!(
+        reopened.has_piece_table(),
+        "same-path discard recovery should restore the piece-table session"
+    );
+    assert!(
+        reopened.text_lossy().starts_with("Z123abc\ndef\n"),
+        "reopened recovery should keep the post-discard edit"
+    );
+    assert!(
+        reopened.try_undo().unwrap(),
+        "same-path discard recovery should preserve undo history"
+    );
+    assert!(
+        reopened.text_lossy().starts_with("123abc\ndef\n"),
+        "undo after recovered discard should reach the pre-discard edit state"
+    );
+    assert!(
+        reopened.try_redo().unwrap(),
+        "same-path discard recovery should preserve redo history"
+    );
+    assert!(
+        reopened.text_lossy().starts_with("Z123abc\ndef\n"),
+        "redo after recovered discard should restore the latest state"
+    );
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn same_path_async_save_discard_rebases_reordered_add_history() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-same-path-discard-reordered-add-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("source.txt");
+    let original = b"abc\ndef\n".repeat((1024 * 1024 / 8) + 1);
+    fs::write(&path, &original).unwrap();
+
+    let mut tab = EditorTab::new(221);
+    tab.open_file(path.clone()).unwrap();
+    let _ = tab.try_insert(TextPosition::new(0, 0), "X").unwrap();
+    let _ = tab.try_insert(TextPosition::new(0, 0), "Y").unwrap();
+
+    assert!(tab.save_async().unwrap());
+    let _ = tab
+        .document_mut()
+        .try_insert_text_at(0, 0, "Z")
+        .expect("raw document edit should still work");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(result) = tab.poll_background_job() {
+            let err = result.unwrap_err();
+            assert!(matches!(
+                err,
+                crate::DocumentError::Write {
+                    path: failed_path,
+                    ref source,
+                } if failed_path == path
+                    && source.to_string() == "background save result discarded after current session state changed"
+            ));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "same-path reordered-add discard test timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    tab.document_mut().flush_session().unwrap();
+
+    let mut reopened = Document::open(path.clone()).unwrap();
+    assert!(reopened.text_lossy().starts_with("ZYXabc\ndef\n"));
+    assert!(reopened.try_undo().unwrap());
+    assert!(reopened.text_lossy().starts_with("YXabc\ndef\n"));
+    assert!(reopened.try_redo().unwrap());
+    assert!(reopened.text_lossy().starts_with("ZYXabc\ndef\n"));
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn same_path_async_save_discard_is_recoverable_without_manual_flush() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-same-path-discard-immediate-recovery-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("source.txt");
+    let original = b"abc\ndef\n".repeat((1024 * 1024 / 8) + 1);
+    fs::write(&path, &original).unwrap();
+
+    let mut tab = EditorTab::new(222);
+    tab.open_file(path.clone()).unwrap();
+    let _ = tab.try_insert(TextPosition::new(0, 0), "123").unwrap();
+
+    assert!(tab.save_async().unwrap());
+    let _ = tab
+        .document_mut()
+        .try_insert_text_at(0, 0, "Z")
+        .expect("raw document edit should still work");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(result) = tab.poll_background_job() {
+            let err = result.unwrap_err();
+            assert!(matches!(
+                err,
+                crate::DocumentError::Write {
+                    path: failed_path,
+                    ref source,
+                } if failed_path == path
+                    && source.to_string() == "background save result discarded after current session state changed"
+            ));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "same-path immediate recovery test timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let reopened = Document::open(path.clone()).unwrap();
+    assert!(reopened.is_dirty());
+    assert!(reopened.has_piece_table());
+    assert!(reopened.text_lossy().starts_with("Z123abc\ndef\n"));
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn same_path_async_save_discard_preserves_removed_pre_save_add_history() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-same-path-discard-removed-pre-save-add-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("source.txt");
+    let original = b"abc\ndef\n".repeat((1024 * 1024 / 8) + 1);
+    fs::write(&path, &original).unwrap();
+
+    let mut tab = EditorTab::new(223);
+    tab.open_file(path.clone()).unwrap();
+    let _ = tab.try_insert(TextPosition::new(0, 0), "X").unwrap();
+    let _ = tab.try_backspace(TextPosition::new(0, 1)).unwrap();
+    let _ = tab.try_insert(TextPosition::new(0, 0), "123").unwrap();
+
+    assert!(tab.save_async().unwrap());
+    let _ = tab
+        .document_mut()
+        .try_insert_text_at(0, 0, "Z")
+        .expect("raw document edit should still work");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(result) = tab.poll_background_job() {
+            let err = result.unwrap_err();
+            assert!(matches!(
+                err,
+                crate::DocumentError::Write {
+                    path: failed_path,
+                    ref source,
+                } if failed_path == path
+                    && source.to_string() == "background save result discarded after current session state changed"
+            ));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "same-path removed-pre-save-add discard test timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut reopened = Document::open(path.clone()).unwrap();
+    assert!(
+        reopened.is_dirty(),
+        "discarded same-path save should remain recoverable even when older undo history references removed pre-save add text"
+    );
+    assert!(reopened.has_piece_table());
+    assert!(reopened.text_lossy().starts_with("Z123abc\ndef\n"));
+    assert!(reopened.try_undo().unwrap());
+    assert!(reopened.text_lossy().starts_with("123abc\ndef\n"));
+    assert!(reopened.try_undo().unwrap());
+    assert!(reopened.text_lossy().starts_with("abc\ndef\n"));
+    assert!(reopened.try_undo().unwrap());
+    assert!(reopened.text_lossy().starts_with("Xabc\ndef\n"));
+
+    let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1859,6 +2283,74 @@ fn cancel_clear_dirty_after_open_preserves_real_edit() {
 }
 
 #[test]
+fn after_text_edit_frame_does_not_clear_real_tab_edit_after_clean_open() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-editor-dirty-open-auto-cancel-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("dirty-open-auto-cancel.txt");
+    fs::write(&path, b"alpha\n").unwrap();
+
+    let mut tab = EditorTab::new(31);
+    tab.open_file(path.clone()).unwrap();
+    let cursor = tab.try_insert(TextPosition::new(0, 0), "X").unwrap();
+    assert_eq!(cursor, TextPosition::new(0, 1));
+    assert!(tab.is_dirty());
+
+    tab.after_text_edit_frame();
+
+    assert!(tab.is_dirty());
+    assert!(tab.status().is_dirty());
+    assert_eq!(tab.text(), "Xalpha\n");
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn after_document_frame_does_not_clear_real_session_edit_after_async_open() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-session-dirty-open-auto-cancel-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("dirty-open-auto-cancel.txt");
+    fs::write(&path, b"alpha\n").unwrap();
+
+    let mut session = DocumentSession::new();
+    session.open_file_async(path.clone()).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(result) = session.poll_background_job() {
+            result.unwrap();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "async open before dirty-frame regression timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let cursor = session
+        .try_insert(TextPosition::new(0, 0), "X")
+        .expect("session edit should succeed after async open");
+    assert_eq!(cursor, TextPosition::new(0, 1));
+    assert!(session.is_dirty());
+
+    session.after_document_frame();
+
+    assert!(session.is_dirty());
+    assert!(session.status().is_dirty());
+    assert_eq!(session.text(), "Xalpha\n");
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn document_session_rejects_edits_while_async_open_is_in_progress() {
     let dir = std::env::temp_dir().join(format!("qem-session-open-guard-{}", std::process::id()));
     let _ = fs::create_dir_all(&dir);
@@ -2238,6 +2730,146 @@ fn document_session_set_path_while_close_is_deferred_cancels_pending_close() {
 
     let _ = fs::remove_file(&current);
     let _ = fs::remove_file(&next);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_save_writes_after_set_path_even_when_document_is_clean() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-session-save-after-set-path-clean-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let source = dir.join("source.txt");
+    let target = dir.join("target.txt");
+    fs::write(&source, b"alpha\nbeta\n").unwrap();
+
+    let mut session = DocumentSession::new();
+    session.open_file(source.clone()).unwrap();
+    assert!(!session.is_dirty());
+
+    session.set_path(target.clone());
+    session.save().unwrap();
+
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        b"alpha\nbeta\n",
+        "save() should materialize the clean document at the overridden path"
+    );
+    assert_eq!(session.current_path(), Some(target.as_path()));
+
+    let _ = fs::remove_file(&source);
+    let _ = fs::remove_file(&target);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tab_save_async_writes_after_set_path_even_when_document_is_clean() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-tab-save-async-after-set-path-clean-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let source = dir.join("source.txt");
+    let target = dir.join("target.txt");
+    fs::write(&source, b"alpha\nbeta\n").unwrap();
+
+    let mut tab = EditorTab::new(224);
+    tab.open_file(source.clone()).unwrap();
+    assert!(!tab.is_dirty());
+
+    tab.set_path(target.clone());
+    assert!(
+        tab.save_async().unwrap(),
+        "clean save_async after set_path should start a real save"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(result) = tab.poll_background_job() {
+            result.unwrap();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "clean save_async after set_path timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(fs::read(&target).unwrap(), b"alpha\nbeta\n");
+    assert_eq!(tab.current_path(), Some(target.as_path()));
+
+    let _ = fs::remove_file(&source);
+    let _ = fs::remove_file(&target);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn session_save_rewrites_clean_file_after_external_mutation() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-session-save-clean-external-mutation-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("source.txt");
+    fs::write(&path, b"alpha\nbeta\n").unwrap();
+
+    let mut session = DocumentSession::new();
+    session.open_file(path.clone()).unwrap();
+    assert!(!session.is_dirty());
+
+    fs::write(&path, b"mutated\n").unwrap();
+    session.save().unwrap();
+
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"alpha\nbeta\n",
+        "explicit save should restore the in-memory clean document after external mutation"
+    );
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn tab_save_async_rewrites_clean_file_after_external_mutation() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-tab-save-async-clean-external-mutation-{}",
+        std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("source.txt");
+    fs::write(&path, b"alpha\nbeta\n").unwrap();
+
+    let mut tab = EditorTab::new(225);
+    tab.open_file(path.clone()).unwrap();
+    assert!(!tab.is_dirty());
+
+    fs::write(&path, b"mutated\n").unwrap();
+    assert!(
+        tab.save_async().unwrap(),
+        "explicit save_async should start when the live file diverged externally"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(result) = tab.poll_background_job() {
+            result.unwrap();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "clean save_async after external mutation timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(fs::read(&path).unwrap(), b"alpha\nbeta\n");
+
+    let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&dir);
 }
 

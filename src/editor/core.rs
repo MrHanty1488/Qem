@@ -213,6 +213,9 @@ impl SessionCore {
                         BackgroundIssueKind::LoadFailed,
                         &err,
                     ));
+                    if self.async_state.take_close_request() == CloseRequest::AfterCurrentJob {
+                        self.finish_close();
+                    }
                     return Some(Err(err));
                 };
                 let err = DocumentError::Open {
@@ -226,6 +229,9 @@ impl SessionCore {
                     BackgroundIssueKind::LoadFailed,
                     &err,
                 ));
+                if self.async_state.take_close_request() == CloseRequest::AfterCurrentJob {
+                    self.finish_close();
+                }
                 return Some(Err(err));
             }
         };
@@ -305,6 +311,7 @@ impl SessionCore {
     }
 
     fn note_session_state_change(&mut self) {
+        self.async_state.clear_clean_mark_after_open();
         if let Some(job) = self.active_job_kind() {
             self.async_state.mark_result_stale(job);
             self.async_state.cancel_deferred_close();
@@ -458,6 +465,9 @@ impl SessionCore {
     }
 
     pub(super) fn save(&mut self) -> Result<(), SaveError> {
+        if self.is_saving() {
+            return Err(SaveError::InProgress);
+        }
         if self.is_loading() {
             let path = self.load_report_path();
             return Err(SaveError::Io(DocumentError::Write {
@@ -468,7 +478,7 @@ impl SessionCore {
         let Some(path) = self.current_path().map(|p| p.to_path_buf()) else {
             return Err(SaveError::NoPath);
         };
-        if !self.doc.is_dirty() {
+        if self.doc.can_skip_clean_preserve_save_to_path(&path) {
             return Ok(());
         }
         self.doc.save_to(&path).map_err(SaveError::Io)?;
@@ -487,11 +497,22 @@ impl SessionCore {
         options: DocumentSaveOptions,
     ) -> Result<(), DocumentError> {
         let report_path = path.clone();
+        if self.is_saving() {
+            return Err(DocumentError::Write {
+                path: report_path,
+                source: io::Error::other("save already in progress"),
+            });
+        }
         if self.is_loading() {
             return Err(DocumentError::Write {
                 path: report_path,
                 source: io::Error::other("cannot save while load is in progress"),
             });
+        }
+        if matches!(options.encoding_policy(), crate::SaveEncodingPolicy::Preserve)
+            && self.doc.can_skip_clean_preserve_save_to_path(&path)
+        {
+            return Ok(());
         }
         self.doc.save_to_with_options(&path, options)?;
         self.last_background_issue = None;
@@ -536,6 +557,7 @@ impl SessionCore {
                         BackgroundIssueKind::SaveFailed,
                         &err,
                     ));
+                    self.async_state.take_close_request();
                     return Some(Err(err));
                 };
                 let err = DocumentError::Write {
@@ -549,6 +571,7 @@ impl SessionCore {
                     BackgroundIssueKind::SaveFailed,
                     &err,
                 ));
+                self.async_state.take_close_request();
                 return Some(Err(err));
             }
         };
@@ -559,6 +582,7 @@ impl SessionCore {
         Some(match state {
             Ok(completion) => {
                 if disposition == ResultDisposition::Discard {
+                    self.doc.handle_discarded_save_completion(&completion);
                     let err = DocumentError::Write {
                         path: completion.path,
                         source: io::Error::other(
@@ -654,12 +678,10 @@ impl SessionCore {
             });
         }
 
-        if !self.doc.is_dirty()
-            && self.current_path() == Some(path.as_path())
-            && matches!(
-                options.encoding_policy(),
-                crate::SaveEncodingPolicy::Preserve
-            )
+        if matches!(
+            options.encoding_policy(),
+            crate::SaveEncodingPolicy::Preserve
+        ) && self.doc.can_skip_clean_preserve_save_to_path(&path)
         {
             return Ok(false);
         }
@@ -789,5 +811,86 @@ fn missing_save_job_error() -> DocumentError {
     DocumentError::Write {
         path: PathBuf::new(),
         source: io::Error::other("background save job disappeared unexpectedly"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disconnected_load_worker_honors_deferred_close() {
+        let (tx, rx) = mpsc::channel();
+        let path = PathBuf::from("disconnected-load.txt");
+        drop(tx);
+
+        let mut core = SessionCore::new();
+        core.load_job = Some(LoadJob {
+            path: Arc::new(path.clone()),
+            total_bytes: 0,
+            loaded_bytes: Arc::new(AtomicU64::new(0)),
+            phase: Arc::new(AtomicU8::new(LoadPhase::Opening.as_raw())),
+            rx,
+        });
+
+        assert!(!core.close_file());
+        assert!(core.close_pending());
+
+        let err = core
+            .poll_load_job()
+            .expect("disconnected load should surface immediately")
+            .expect_err("disconnected load should fail");
+        assert!(matches!(
+            err,
+            DocumentError::Open {
+                path: failed_path,
+                ref source,
+            } if failed_path == path
+                && source.to_string() == "load worker disconnected unexpectedly"
+        ));
+        assert!(!core.close_pending());
+        assert!(!core.is_busy());
+        assert!(core.current_path().is_none());
+        assert!(core.is_empty_document());
+        assert!(core.background_issue().is_none());
+    }
+
+    #[test]
+    fn disconnected_save_worker_clears_deferred_close_without_closing_document() {
+        let (tx, rx) = mpsc::channel();
+        let path = PathBuf::from("disconnected-save.txt");
+        drop(tx);
+
+        let mut core = SessionCore::new();
+        core.doc.set_path(path.clone());
+        core.save_job = Some(SaveJob {
+            path: Arc::new(path.clone()),
+            total_bytes: 0,
+            written_bytes: Arc::new(AtomicU64::new(0)),
+            rx,
+        });
+
+        assert!(!core.close_file());
+        assert!(core.close_pending());
+
+        let err = core
+            .poll_save_job()
+            .expect("disconnected save should surface immediately")
+            .expect_err("disconnected save should fail");
+        assert!(matches!(
+            err,
+            DocumentError::Write {
+                path: failed_path,
+                ref source,
+            } if failed_path == path
+                && source.to_string() == "save worker disconnected unexpectedly"
+        ));
+        assert!(!core.close_pending());
+        assert!(!core.is_busy());
+        assert_eq!(core.current_path(), Some(path.as_path()));
+        let issue = core
+            .background_issue()
+            .expect("disconnected save should retain background issue");
+        assert_eq!(issue.kind(), BackgroundIssueKind::SaveFailed);
     }
 }

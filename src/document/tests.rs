@@ -1796,6 +1796,104 @@ fn line_slices_match_exact_mmap_lines() {
 }
 
 #[test]
+fn incomplete_mmap_singular_line_read_uses_exact_scan_for_existing_line() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("incomplete-mmap-exact-lines.txt");
+    std::fs::write(&path, b"zero\none\ntwo\n").unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: std::fs::metadata(&path).unwrap().len() as usize,
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(128)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: None,
+        dirty: false,
+    };
+
+    let slice = doc.line_slice(1, 0, 16);
+    assert_eq!(slice.text(), "one");
+    assert!(slice.is_exact());
+}
+
+#[test]
+fn incomplete_mmap_single_row_batch_reads_match_singular_line_lookup() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("incomplete-mmap-single-row-batch.txt");
+    std::fs::write(&path, b"zero\none\ntwo\n").unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: std::fs::metadata(&path).unwrap().len() as usize,
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(128)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: None,
+        dirty: false,
+    };
+
+    let single = doc.line_slice(1, 0, 16);
+    assert_eq!(single.text(), "one");
+    assert!(single.is_exact());
+
+    let slices = doc.line_slices(1, 1, 0, 16);
+    assert_eq!(slices.len(), 1);
+    assert_eq!(slices[0].text(), "one");
+    assert!(slices[0].is_exact());
+
+    let viewport = doc.read_viewport(ViewportRequest::new(1, 1).with_columns(0, 16));
+    assert_eq!(viewport.rows().len(), 1);
+    assert_eq!(viewport.rows()[0].text(), "one");
+    assert!(viewport.rows()[0].is_exact());
+}
+
+#[test]
+fn fully_indexed_mmap_out_of_range_line_reads_are_exact_empty() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("exact-mmap-out-of-range-lines.txt");
+    std::fs::write(&path, b"zero\none\n").unwrap();
+
+    let doc = Document::open(&path).unwrap();
+    assert!(doc.is_line_count_exact());
+
+    let slice = doc.line_slice(99, 0, 16);
+    assert_eq!(slice.text(), "");
+    assert!(slice.is_exact());
+
+    let slices = doc.line_slices(99, 2, 0, 16);
+    assert_eq!(slices.len(), 2);
+    assert!(slices.iter().all(|slice| slice.text().is_empty()));
+    assert!(slices.iter().all(LineSlice::is_exact));
+
+    let viewport = doc.read_viewport(ViewportRequest::new(99, 2).with_columns(0, 16));
+    assert_eq!(viewport.rows().len(), 2);
+    assert!(viewport.rows().iter().all(|row| row.text().is_empty()));
+    assert!(viewport.rows().iter().all(ViewportRow::is_exact));
+}
+
+#[test]
 fn line_slices_use_exact_piece_table_fast_path_after_edit() {
     let dir = std::env::temp_dir().join(format!("qem-piece-table-slices-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
@@ -1816,6 +1914,767 @@ fn line_slices_use_exact_piece_table_fast_path_after_edit() {
 }
 
 #[test]
+fn partial_piece_table_line_reads_follow_current_text_after_prefix_edit() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("partial-piece-table-lines.txt");
+    std::fs::write(&path, b"zero\none\ntwo\nthree\n").unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: std::fs::metadata(&path).unwrap().len() as usize,
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(4)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5, 4], false)),
+        dirty: false,
+    };
+
+    let cursor = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+    assert_eq!(cursor, (1, 0));
+    assert!(doc.piece_table.is_some());
+    assert!(doc.text_lossy().starts_with("TOP\nzero\none\ntwo\nthree\n"));
+
+    let slice = doc.line_slice(3, 0, 16);
+    assert_eq!(slice.text(), "two");
+    assert!(slice.is_exact());
+
+    let slices = doc.line_slices(2, 3, 0, 16);
+    let texts: Vec<String> = slices.into_iter().map(LineSlice::into_text).collect();
+    assert_eq!(texts, vec!["one", "two", "three"]);
+
+    let text = doc.read_text(TextRange::new(TextPosition::new(3, 0), 3));
+    assert_eq!(text.text(), "two");
+    assert!(text.is_exact());
+
+    let found = doc.find_next("two", TextPosition::new(3, 0)).unwrap();
+    assert_eq!(found.start(), TextPosition::new(3, 0));
+    assert_eq!(found.end(), TextPosition::new(3, 3));
+}
+
+#[test]
+fn singular_partial_piece_table_line_slice_does_not_fall_back_to_stale_mmap() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("partial-piece-table-singular-slice.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(1),
+    ));
+    bytes.push(b'\n');
+    bytes.extend_from_slice(b"tail\n");
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    let singular = doc.line_slice(3, 0, 16);
+    let batched = doc.line_slices(3, 1, 0, 16).pop().unwrap();
+
+    assert_eq!(singular, batched);
+    assert!(!singular.is_exact());
+    assert_eq!(singular.text(), "");
+}
+
+#[test]
+fn partial_piece_table_find_prev_does_not_return_match_after_unresolved_before_position() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("partial-piece-table-find-prev-boundary.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
+    bytes.extend_from_slice(b"target\n");
+    bytes.extend_from_slice(b"tail target\n");
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    assert_eq!(
+        doc.find_prev("target", TextPosition::new(2, 2)),
+        None,
+        "reverse search must not escape past an unresolved partial piece-table boundary"
+    );
+    let query = LiteralSearchQuery::new("target").unwrap();
+    assert_eq!(doc.find_prev_query(&query, TextPosition::new(2, 2)), None);
+}
+
+#[test]
+fn partial_piece_table_find_next_does_not_start_before_unresolved_from_position() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("partial-piece-table-find-next-boundary.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
+    bytes.extend_from_slice(b"target\n");
+    bytes.extend_from_slice(b"tail target\n");
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    assert_eq!(
+        doc.find_next("target", TextPosition::new(3, 0)),
+        None,
+        "forward search must not rewind before an unresolved partial piece-table start position"
+    );
+    let query = LiteralSearchQuery::new("target").unwrap();
+    assert_eq!(doc.find_next_query(&query, TextPosition::new(3, 0)), None);
+}
+
+#[test]
+fn partial_piece_table_find_next_and_iterators_do_not_relabel_match_before_unresolved_start() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("partial-piece-table-find-next-relabel.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend_from_slice(b"target");
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
+    bytes.push(b'\n');
+    bytes.extend_from_slice(b"tail\n");
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    assert_eq!(doc.find_next("target", TextPosition::new(3, 0)), None);
+    let query = LiteralSearchQuery::new("target").unwrap();
+    assert_eq!(doc.find_next_query(&query, TextPosition::new(3, 0)), None);
+    assert_eq!(
+        doc.find_all_from("target", TextPosition::new(3, 0))
+            .collect::<Vec<_>>(),
+        Vec::<SearchMatch>::new()
+    );
+    assert_eq!(
+        doc.find_all_query_from(&query, TextPosition::new(3, 0))
+            .collect::<Vec<_>>(),
+        Vec::<SearchMatch>::new()
+    );
+}
+
+#[test]
+fn partial_piece_table_find_next_can_start_on_scannable_incomplete_line() {
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("partial-piece-table-find-next-scannable-incomplete-line.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend_from_slice(b"target");
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    let visible = doc.read_text(TextRange::new(TextPosition::new(2, 0), 6));
+    assert_eq!(visible.text(), "target");
+
+    let found = doc.find_next("target", TextPosition::new(2, 0)).unwrap();
+    assert_eq!(found.start(), TextPosition::new(2, 0));
+    assert_eq!(found.end(), TextPosition::new(2, 6));
+    let found_text = doc.read_text(found.range());
+    assert_eq!(found_text.text(), "target");
+    assert!(found_text.is_exact());
+
+    let query = LiteralSearchQuery::new("target").unwrap();
+    assert_eq!(doc.find_next_query(&query, TextPosition::new(2, 0)), Some(found));
+    assert_eq!(
+        doc.find_all_from("target", TextPosition::new(2, 0))
+            .collect::<Vec<_>>(),
+        vec![found]
+    );
+    assert_eq!(
+        doc.find_all_query_from(&query, TextPosition::new(2, 0))
+            .collect::<Vec<_>>(),
+        vec![found]
+    );
+}
+
+#[test]
+fn partial_piece_table_line_slice_stays_exact_on_scannable_incomplete_prefix() {
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("partial-piece-table-line-slice-scannable-incomplete-prefix.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend_from_slice(b"target");
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    let slice = doc.line_slice(2, 0, 6);
+    assert_eq!(slice.text(), "target");
+    assert!(slice.is_exact());
+
+    let batch = doc.line_slices(2, 1, 0, 6);
+    assert_eq!(batch[0].text(), "target");
+    assert!(batch[0].is_exact());
+
+    let viewport = doc.read_viewport(ViewportRequest::new(2, 1).with_columns(0, 6));
+    assert_eq!(viewport.rows()[0].text(), "target");
+    assert!(viewport.rows()[0].is_exact());
+}
+
+#[test]
+fn partial_piece_table_find_prev_can_end_on_scannable_incomplete_line() {
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("partial-piece-table-find-prev-scannable-incomplete-line.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend_from_slice(b"target");
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    let found = doc.find_prev("target", TextPosition::new(2, 6)).unwrap();
+    assert_eq!(found.start(), TextPosition::new(2, 0));
+    assert_eq!(found.end(), TextPosition::new(2, 6));
+
+    let query = LiteralSearchQuery::new("target").unwrap();
+    assert_eq!(doc.find_prev_query(&query, TextPosition::new(2, 6)), Some(found));
+}
+
+#[test]
+fn partial_piece_table_empty_typed_reads_stay_exact_on_scannable_incomplete_line() {
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("partial-piece-table-empty-typed-read-scannable-incomplete-line.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend_from_slice(b"target");
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    let slice = doc.read_text(TextRange::new(TextPosition::new(2, 0), 0));
+    assert_eq!(slice.text(), "");
+    assert!(slice.is_exact());
+
+    let selection = doc.read_selection(TextSelection::caret(TextPosition::new(2, 0)));
+    assert_eq!(selection.text(), "");
+    assert!(selection.is_exact());
+}
+
+#[test]
+fn selection_read_stays_exact_when_partial_piece_table_head_is_scannable_incomplete() {
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("selection-read-partial-piece-table-scannable-incomplete-head.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend_from_slice(b"target");
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    let slice = doc.read_selection(TextSelection::new(
+        TextPosition::new(1, 0),
+        TextPosition::new(2, 6),
+    ));
+    assert_eq!(slice.text(), "zero\ntarget");
+    assert!(slice.is_exact());
+}
+
+#[test]
+fn typed_range_read_matches_selection_exactness_on_scannable_incomplete_partial_line() {
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("typed-range-read-partial-piece-table-scannable-incomplete-head.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend_from_slice(b"target");
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    let selection = TextSelection::new(TextPosition::new(1, 0), TextPosition::new(2, 6));
+    let selected = doc.read_selection(selection);
+    let ranged = doc.read_text(doc.text_range_for_selection(selection));
+
+    assert_eq!(ranged.text(), selected.text());
+    assert_eq!(ranged.is_exact(), selected.is_exact());
+    assert!(ranged.is_exact());
+}
+
+#[test]
+fn partial_piece_table_bounded_search_does_not_escape_unresolved_end_position() {
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("partial-piece-table-bounded-search-end.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
+    bytes.extend_from_slice(b"target\n");
+    bytes.extend_from_slice(b"tail target\n");
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    assert_eq!(
+        doc.find_all_between("target", TextPosition::new(0, 0), TextPosition::new(2, 2))
+            .collect::<Vec<_>>(),
+        Vec::<SearchMatch>::new(),
+        "bounded search must not widen an unresolved partial piece-table end position to EOF"
+    );
+    let query = LiteralSearchQuery::new("target").unwrap();
+    assert_eq!(
+        doc.find_all_query_between(&query, TextPosition::new(0, 0), TextPosition::new(2, 2))
+            .collect::<Vec<_>>(),
+        Vec::<SearchMatch>::new()
+    );
+}
+
+#[test]
+fn partial_piece_table_bounded_search_does_not_expand_unresolved_end_line_to_eof() {
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("partial-piece-table-bounded-search-unresolved-line-end.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
+    bytes.push(b'\n');
+    bytes.extend_from_slice(b"target tail\n");
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    assert_eq!(
+        doc.find_all_between("target", TextPosition::new(0, 0), TextPosition::new(3, 0))
+            .collect::<Vec<_>>(),
+        Vec::<SearchMatch>::new()
+    );
+    let query = LiteralSearchQuery::new("target").unwrap();
+    assert_eq!(
+        doc.find_all_query_between(&query, TextPosition::new(0, 0), TextPosition::new(3, 0))
+            .collect::<Vec<_>>(),
+        Vec::<SearchMatch>::new()
+    );
+}
+
+#[test]
+fn partial_piece_table_find_next_in_range_does_not_rewind_unresolved_start() {
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("partial-piece-table-find-next-in-range-start.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend_from_slice(b"target");
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
+    bytes.push(b'\n');
+    bytes.extend_from_slice(b"tail\n");
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    assert_eq!(
+        doc.find_next_in_range("target", TextRange::new(TextPosition::new(3, 0), 8)),
+        None
+    );
+    let query = LiteralSearchQuery::new("target").unwrap();
+    assert_eq!(doc.find_next_query_in_range(&query, TextRange::new(TextPosition::new(3, 0), 8)), None);
+}
+
+#[test]
+fn partial_piece_table_line_slices_do_not_invent_trailing_empty_line_without_newline() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("partial-piece-table-no-trailing-newline.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend(std::iter::repeat_n(b'x', 64));
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let slices = doc.line_slices(1, 2, 0, 16);
+    assert_eq!(slices[0].text(), "xxxxxxxxxxxxxxxx");
+    assert!(slices[0].is_exact());
+    assert_eq!(slices[1].text(), "");
+    assert!(!slices[1].is_exact());
+
+    let viewport = doc.read_viewport(ViewportRequest::new(1, 2).with_columns(0, 16));
+    assert_eq!(viewport.rows()[0].text(), "xxxxxxxxxxxxxxxx");
+    assert!(viewport.rows()[0].is_exact());
+    assert_eq!(viewport.rows()[1].text(), "");
+    assert!(!viewport.rows()[1].is_exact());
+}
+
+#[test]
+fn partial_piece_table_position_helpers_do_not_fall_back_to_stale_mmap_beyond_scan_window() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("partial-piece-table-position-window.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(1),
+    ));
+    bytes.push(b'\n');
+    bytes.extend_from_slice(b"tail\n");
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    assert_eq!(doc.line_slice(3, 0, 16).text(), "");
+    assert_eq!(doc.line_len_chars(3), 0);
+    assert_eq!(doc.clamp_position(TextPosition::new(3, 99)), TextPosition::new(3, 0));
+}
+
+#[test]
 fn lines_iterator_yields_current_document_lines() {
     let mut doc = Document::new();
     let _ = doc.try_insert_text_at(0, 0, "zero\none\ntwo").unwrap();
@@ -1824,6 +2683,56 @@ fn lines_iterator_yields_current_document_lines() {
 
     assert_eq!(lines, vec!["zero", "one", "two"]);
 }
+
+#[test]
+fn lines_iterator_uses_known_lower_bound_while_mmap_indexing_is_incomplete() {
+    let dir = std::env::temp_dir().join(format!("qem-doc-lines-lower-bound-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("single-line-large.bin");
+    {
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((INLINE_FULL_INDEX_MAX_FILE_BYTES + 1) as u64).unwrap();
+    }
+
+    let doc = Document::open(&path).unwrap();
+    assert!(doc.is_indexing());
+    assert!(!doc.is_line_count_exact());
+
+    let mut lines = doc.lines();
+    assert_eq!(lines.len(), 1);
+    assert!(lines.next().is_some());
+    assert_eq!(lines.next(), None);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn byte_progress_fraction_treats_empty_or_overreported_work_as_complete() {
+    assert_eq!(ByteProgress::new(0, 0).fraction(), 1.0);
+    assert_eq!(ByteProgress::new(12, 10).fraction(), 1.0);
+}
+
+#[test]
+fn raw_rope_edit_helpers_clamp_out_of_range_line_indices() {
+    let mut doc = Document::new();
+    let _ = doc.try_insert_text_at(0, 0, "hello\nworld").unwrap();
+
+    assert_eq!(doc.line_len_chars(99), 5);
+
+    let cursor = doc.try_insert_text_at(99, 0, ">>").unwrap();
+    assert_eq!(cursor, (1, 2));
+    assert_eq!(doc.text_lossy(), "hello\n>>world");
+
+    let cursor = doc.try_replace_range(99, 2, 3, "X").unwrap();
+    assert_eq!(cursor, (1, 3));
+    assert_eq!(doc.text_lossy(), "hello\n>>Xld");
+
+    let backspace = doc.try_backspace_at(99, 3).unwrap();
+    assert_eq!(backspace, (true, 1, 2));
+    assert_eq!(doc.text_lossy(), "hello\n>>ld");
+}
+
 
 #[test]
 fn replace_range_updates_rope_backed_documents() {
@@ -1851,6 +2760,24 @@ fn replace_range_updates_piece_table_backed_documents() {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn raw_piece_table_replace_range_clamps_out_of_range_line_indices() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("piece-table-raw-replace-clamp.txt");
+    let repeat = (PIECE_TABLE_MIN_BYTES / 8).saturating_add(1);
+    let mut bytes = b"abc\ndef\n".repeat(repeat);
+    bytes.extend_from_slice(b"tail");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut doc = Document::open(&path).unwrap();
+    let cursor = doc.try_replace_range(usize::MAX, 2, 2, "XX").unwrap();
+
+    let last_line0 = repeat.saturating_mul(2);
+    assert_eq!(cursor, (last_line0, 4));
+    assert!(doc.has_piece_table());
+    assert!(doc.text_lossy().ends_with("taXX"));
 }
 
 #[test]
@@ -1982,6 +2909,46 @@ fn line_slices_near_tail_read_from_file_end_before_full_index() {
     let texts: Vec<String> = slices.into_iter().map(LineSlice::into_text).collect();
 
     assert_eq!(texts, vec!["c", "d", ""]);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn line_slices_near_tail_do_not_invent_empty_eof_row_without_trailing_newline() {
+    let dir = std::env::temp_dir().join(format!(
+        "qem-tail-fast-path-no-eof-newline-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("tail-no-eof-newline.txt");
+    std::fs::write(&path, b"a\nb\nc\nd").unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(true)),
+        indexing_started: None,
+        file_len: 7,
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(2)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::NewDocument,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: None,
+        dirty: false,
+    };
+
+    let slices = doc.line_slices(9_999, 3, 0, 16);
+    let texts: Vec<String> = slices.into_iter().map(LineSlice::into_text).collect();
+
+    assert_eq!(texts, vec!["b", "c", "d"]);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
@@ -2166,6 +3133,156 @@ fn piece_table_save_to_rebases_future_recovery_to_saved_path() {
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&dst);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn piece_table_save_as_reopen_failure_keeps_old_recovery_sidecar() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("large.txt");
+    let dst = dir.path().join("large-copy.txt");
+    write_disk_backed_fixture(&src);
+
+    let mut doc = Document::open(src.clone()).unwrap();
+    let _ = doc.try_insert_text_at(0, 0, "123").unwrap();
+    assert!(doc.has_piece_table());
+    doc.flush_session().unwrap();
+    assert!(
+        editlog_path(&src).exists(),
+        "source sidecar should exist before forced reopen failure"
+    );
+
+    let prepared = doc.prepare_save(&dst).unwrap();
+    let completion = prepared.execute(Arc::new(AtomicU64::new(0))).unwrap();
+    std::fs::remove_file(&dst).unwrap();
+
+    let err = doc
+        .finish_save(
+            completion.path.clone(),
+            completion.reload_after_save,
+            completion.encoding,
+            completion.encoding_origin,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        DocumentError::Open {
+            path: failed_path,
+            ..
+        } if failed_path == dst
+    ));
+    assert_eq!(doc.path(), Some(src.as_path()));
+    assert!(doc.is_dirty());
+    assert!(doc.has_piece_table());
+    assert!(doc.text_lossy().starts_with("123abc\ndef\n"));
+    assert!(
+        editlog_path(&src).exists(),
+        "failed save-as reopen should keep the old recoverable sidecar"
+    );
+}
+
+#[test]
+fn piece_table_same_path_save_reopen_failure_restores_recovery_sidecar() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("large.txt");
+    write_disk_backed_fixture(&path);
+
+    let mut doc = Document::open(path.clone()).unwrap();
+    let _ = doc.try_insert_text_at(0, 0, "123").unwrap();
+    assert!(doc.has_piece_table());
+    doc.flush_session().unwrap();
+    let sidecar = editlog_path(&path);
+    let original_sidecar = std::fs::read(&sidecar).unwrap();
+
+    let prepared = doc.prepare_save(&path).unwrap();
+    let completion = prepared.execute(Arc::new(AtomicU64::new(0))).unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    let err = doc
+        .finish_save(
+            completion.path.clone(),
+            completion.reload_after_save,
+            completion.encoding,
+            completion.encoding_origin,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        DocumentError::Open {
+            path: failed_path,
+            ..
+        } if failed_path == path
+    ));
+    assert_eq!(doc.path(), Some(path.as_path()));
+    assert!(doc.is_dirty());
+    assert!(doc.has_piece_table());
+    assert!(doc.text_lossy().starts_with("123abc\ndef\n"));
+    assert!(
+        sidecar.exists(),
+        "failed same-path reopen should restore recoverable sidecar"
+    );
+    assert_eq!(std::fs::read(&sidecar).unwrap(), original_sidecar);
+}
+
+#[test]
+fn large_piece_table_non_utf8_save_is_rejected_before_write() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("huge-source.txt");
+    let dst = dir.path().join("huge-cp1251.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+
+    let mut file = std::fs::File::create(&src).unwrap();
+    use std::io::Write as _;
+    file.write_all(b"line\n").unwrap();
+    file.set_len((MAX_ROPE_EDIT_FILE_BYTES + 1) as u64).unwrap();
+    drop(file);
+
+    let mut doc = Document::open(src.clone()).unwrap();
+    let _ = doc.try_insert_text_at(0, 0, "X").unwrap();
+    assert!(doc.has_piece_table());
+
+    let err = doc.save_to_with_encoding(&dst, encoding).unwrap_err();
+    assert!(matches!(
+        err,
+        DocumentError::Encoding {
+            path: failed_path,
+            operation: "save",
+            encoding: failed_encoding,
+            reason: DocumentEncodingErrorKind::SaveReopenTooLarge { max_bytes },
+        } if failed_path == dst
+            && failed_encoding == encoding
+            && max_bytes == MAX_ROPE_EDIT_FILE_BYTES
+    ));
+    assert!(!dst.exists(), "rejected save must not write a partial destination");
+    assert_eq!(doc.path(), Some(src.as_path()));
+    assert!(doc.is_dirty());
+    assert!(doc.has_piece_table());
+}
+
+#[test]
+fn large_piece_table_non_utf8_save_preflight_reports_reopen_limit() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("huge-source.txt");
+    let encoding = DocumentEncoding::from_label("windows-1251").unwrap();
+
+    let mut file = std::fs::File::create(&src).unwrap();
+    use std::io::Write as _;
+    file.write_all(b"line\n").unwrap();
+    file.set_len((MAX_ROPE_EDIT_FILE_BYTES + 1) as u64).unwrap();
+    drop(file);
+
+    let mut doc = Document::open(src).unwrap();
+    let _ = doc.try_insert_text_at(0, 0, "X").unwrap();
+    assert!(doc.has_piece_table());
+
+    assert_eq!(
+        doc.save_error_for_encoding(encoding),
+        Some(DocumentEncodingErrorKind::SaveReopenTooLarge {
+            max_bytes: MAX_ROPE_EDIT_FILE_BYTES,
+        })
+    );
+    assert!(!doc.can_save_with_encoding(encoding));
 }
 
 #[test]
@@ -2769,6 +3886,202 @@ fn typed_selection_helpers_treat_crlf_as_single_text_unit() {
 }
 
 #[test]
+fn partial_piece_table_position_helpers_follow_current_text_after_prefix_edit() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("partial-piece-table-positions.txt");
+    std::fs::write(&path, b"zero\none\ntwo\nthree\n").unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: std::fs::metadata(&path).unwrap().len() as usize,
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(4)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5, 4], false)),
+        dirty: false,
+    };
+
+    let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    assert_eq!(doc.line_len_chars(3), 3);
+    assert_eq!(doc.clamp_position(TextPosition::new(3, 99)), TextPosition::new(3, 3));
+    assert_eq!(doc.char_index_for_position(TextPosition::new(3, 2)), 15);
+    assert_eq!(
+        doc.text_units_between(TextPosition::new(3, 1), TextPosition::new(4, 2)),
+        5
+    );
+
+    let selection = TextSelection::new(TextPosition::new(4, 2), TextPosition::new(3, 1));
+    let range = doc.text_range_for_selection(selection);
+    assert_eq!(range.start(), TextPosition::new(3, 1));
+    assert_eq!(range.len_chars(), 5);
+
+    let selected = doc.read_selection(selection);
+    assert!(selected.is_exact());
+    assert_eq!(selected.text(), "wo\nth");
+}
+
+#[test]
+fn partial_piece_table_clamp_position_preserves_scannable_lines_beyond_estimated_display_count() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("partial-piece-table-clamp-scannable-lines.txt");
+    std::fs::write(&path, b"a\nb\nc\n").unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: std::fs::metadata(&path).unwrap().len() as usize,
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(128)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![2], false)),
+        dirty: false,
+    };
+
+    assert_eq!(doc.display_line_count(), 1);
+    assert_eq!(doc.line_slice(2, 0, 16).text(), "c");
+    assert!(doc.line_slice(2, 0, 16).is_exact());
+
+    assert_eq!(doc.clamp_position(TextPosition::new(2, 99)), TextPosition::new(2, 1));
+
+    let slice = doc.read_text(TextRange::new(TextPosition::new(2, 0), 1));
+    assert_eq!(slice.text(), "c");
+    assert!(slice.is_exact());
+}
+
+#[test]
+fn partial_piece_table_position_helpers_do_not_invent_text_units_past_safe_boundary() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("partial-piece-table-position-tail.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend(std::iter::repeat_n(b'x', PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32)));
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(1)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    assert_eq!(doc.char_index_for_position(TextPosition::new(99, 0)), 5);
+    assert_eq!(
+        doc.text_units_between(TextPosition::new(0, 0), TextPosition::new(99, 0)),
+        5
+    );
+    assert_eq!(
+        doc.text_range_between(TextPosition::new(0, 0), TextPosition::new(99, 0)),
+        TextRange::new(TextPosition::new(0, 0), 5)
+    );
+}
+
+#[test]
+fn incomplete_mmap_position_helpers_clamp_to_eof_instead_of_inventing_lines() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("incomplete-mmap-position-tail.txt");
+    std::fs::write(&path, b"zero\n").unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: 5,
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(1)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: None,
+        dirty: false,
+    };
+
+    assert_eq!(doc.char_index_for_position(TextPosition::new(99, 0)), 5);
+    assert_eq!(
+        doc.text_units_between(TextPosition::new(0, 0), TextPosition::new(99, 0)),
+        5
+    );
+    assert_eq!(
+        doc.text_range_between(TextPosition::new(0, 0), TextPosition::new(99, 0)),
+        TextRange::new(TextPosition::new(0, 0), 5)
+    );
+}
+
+#[test]
+fn incomplete_mmap_line_len_chars_does_not_invent_tail_columns() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("incomplete-mmap-line-len-tail.txt");
+    std::fs::write(&path, b"zero\n").unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: 5,
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(1)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: None,
+        dirty: false,
+    };
+
+    assert_eq!(doc.line_len_chars(0), 4);
+    assert_eq!(doc.line_len_chars(1), 0);
+    assert_eq!(doc.line_len_chars(99), 0);
+    assert_eq!(doc.clamp_position(TextPosition::new(99, 7)), TextPosition::new(1, 0));
+}
+
+#[test]
 fn typed_columns_count_combining_marks_as_separate_scalar_values() {
     let mut doc = Document::new();
     let _ = doc
@@ -2828,6 +4141,211 @@ fn typed_text_reads_cover_ranges_and_selections() {
 }
 
 #[test]
+fn selection_read_is_inexact_when_partial_piece_table_head_is_unresolved() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("selection-read-partial-piece-table.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
+    bytes.push(b'\n');
+    bytes.extend_from_slice(b"tail\n");
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let _ = doc.try_insert_text_at(0, 0, "TOP\n").unwrap();
+
+    let slice = doc.read_selection(TextSelection::new(
+        TextPosition::new(1, 0),
+        TextPosition::new(3, 2),
+    ));
+
+    assert!(!slice.is_exact());
+    assert!(slice.text().starts_with("zero\n"));
+}
+
+#[test]
+fn selection_read_stays_exact_on_long_exact_partial_piece_table_line() {
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("selection-read-long-exact-partial-piece-table.txt");
+    let prefix = "x".repeat(MAX_LINE_SCAN_CHARS.saturating_add(32));
+    let text = format!("zero\n{prefix}target\n");
+    std::fs::write(&path, text.as_bytes()).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: text.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let start_col = MAX_LINE_SCAN_CHARS.saturating_add(28);
+    let selection = TextSelection::new(
+        TextPosition::new(1, start_col),
+        TextPosition::new(1, start_col.saturating_add(10)),
+    );
+    let slice = doc.read_selection(selection);
+
+    assert!(slice.is_exact());
+    assert_eq!(slice.text(), "xxxxtarget");
+}
+
+#[test]
+fn empty_range_read_is_inexact_when_partial_piece_table_start_is_unresolved() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("empty-range-read-partial-piece-table.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
+    bytes.push(b'\n');
+    bytes.extend_from_slice(b"tail\n");
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let slice = doc.read_text(TextRange::new(TextPosition::new(3, 0), 0));
+
+    assert_eq!(slice.text(), "");
+    assert!(!slice.is_exact());
+}
+
+#[test]
+fn incomplete_mmap_nonempty_range_read_past_eof_is_empty_and_inexact() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("incomplete-mmap-range-past-eof.txt");
+    std::fs::write(&path, b"zero\n").unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: 5,
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(1)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: None,
+        dirty: false,
+    };
+
+    let slice = doc.read_text(TextRange::new(TextPosition::new(99, 0), 3));
+    assert_eq!(slice.text(), "");
+    assert!(slice.is_exact());
+
+    let selection = doc.read_selection(TextSelection::new(
+        TextPosition::new(99, 0),
+        TextPosition::new(99, 3),
+    ));
+    assert_eq!(selection.text(), "");
+    assert!(selection.is_exact());
+}
+
+#[test]
+fn incomplete_mmap_typed_read_uses_exact_start_offset_instead_of_heuristic_line_range() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("incomplete-mmap-typed-read-exact-start.txt");
+    std::fs::write(&path, b"zero\none\ntwo\n").unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: std::fs::metadata(&path).unwrap().len() as usize,
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(128)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: None,
+        dirty: false,
+    };
+
+    let slice = doc.read_text(TextRange::new(TextPosition::new(1, 0), 3));
+    assert_eq!(slice.text(), "one");
+    assert!(slice.is_exact());
+
+    let selection = doc.read_selection(TextSelection::new(
+        TextPosition::new(1, 0),
+        TextPosition::new(1, 3),
+    ));
+    assert_eq!(selection.text(), "one");
+    assert!(selection.is_exact());
+}
+
+#[test]
 fn typed_text_reads_preserve_crlf_in_clean_mmap_documents() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("crlf-selection.txt");
@@ -2860,6 +4378,28 @@ fn typed_slices_support_standard_str_ergonomics() {
     assert_eq!(line_slice.as_ref(), "eta");
     assert_eq!(&*line_slice, "eta");
     assert_eq!(line_slice.to_string(), "eta");
+}
+
+#[test]
+fn zero_width_line_reads_still_preserve_exactness_for_known_lines() {
+    let mut doc = Document::new();
+    let _ = doc
+        .try_insert(TextPosition::new(0, 0), "alpha\nbeta")
+        .unwrap();
+
+    let slice = doc.line_slice(1, 1, 0);
+    assert_eq!(slice.text(), "");
+    assert!(slice.is_exact());
+
+    let slices = doc.line_slices(0, 2, 0, 0);
+    assert_eq!(slices.len(), 2);
+    assert!(slices.iter().all(|slice| slice.text().is_empty()));
+    assert!(slices.iter().all(LineSlice::is_exact));
+
+    let viewport = doc.read_viewport(ViewportRequest::new(0, 2).with_columns(0, 0));
+    assert_eq!(viewport.rows().len(), 2);
+    assert!(viewport.rows().iter().all(|row| row.text().is_empty()));
+    assert!(viewport.rows().iter().all(ViewportRow::is_exact));
 }
 
 #[test]
@@ -2963,6 +4503,48 @@ fn literal_search_finds_previous_match_with_end_before_boundary() {
 }
 
 #[test]
+fn long_exact_mmap_lines_do_not_cap_typed_columns_or_rewind_search_start() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("long-exact-mmap-columns.txt");
+    let prefix = "x".repeat(MAX_LINE_SCAN_CHARS.saturating_add(32));
+    let text = format!("{prefix}target\n");
+    std::fs::write(&path, text.as_bytes()).unwrap();
+
+    let doc = Document::open(&path).unwrap();
+    let line_len = prefix.len().saturating_add("target".len());
+
+    assert_eq!(doc.line_len_chars(0), line_len);
+    assert_eq!(
+        doc.clamp_position(TextPosition::new(0, line_len)),
+        TextPosition::new(0, line_len)
+    );
+    assert_eq!(doc.find_next("target", TextPosition::new(0, line_len)), None);
+}
+
+#[test]
+fn long_piece_table_lines_do_not_cap_typed_columns_or_rewind_search_start() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("long-piece-table-columns.txt");
+    let prefix = "x".repeat(PIECE_TABLE_MIN_BYTES.saturating_add(32));
+    let text = format!("{prefix}target\n");
+    std::fs::write(&path, text.as_bytes()).unwrap();
+
+    let mut doc = Document::open(&path).unwrap();
+    let _ = doc.try_insert(TextPosition::new(0, 0), "!").unwrap();
+    assert_eq!(doc.backing(), DocumentBacking::PieceTable);
+
+    let line_len = 1usize
+        .saturating_add(prefix.len())
+        .saturating_add("target".len());
+    assert_eq!(doc.line_len_chars(0), line_len);
+    assert_eq!(
+        doc.clamp_position(TextPosition::new(0, line_len)),
+        TextPosition::new(0, line_len)
+    );
+    assert_eq!(doc.find_next("target", TextPosition::new(0, line_len)), None);
+}
+
+#[test]
 fn literal_search_bounded_range_returns_only_fully_contained_matches() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("search-bounded-mmap.txt");
@@ -3009,6 +4591,18 @@ fn literal_search_iterator_yields_non_overlapping_matches() {
     assert_eq!(matches[1].start(), TextPosition::new(0, 2));
     assert_eq!(matches[1].end(), TextPosition::new(0, 4));
     assert_eq!(query_matches, matches);
+}
+
+#[test]
+fn literal_search_iterator_is_fused() {
+    fn assert_fused<I: std::iter::FusedIterator>(_iter: I) {}
+
+    let mut doc = Document::new();
+    let _ = doc.try_insert(TextPosition::new(0, 0), "aaaa").unwrap();
+
+    assert_fused(doc.find_all("aa"));
+    let query = LiteralSearchQuery::new("aa").unwrap();
+    assert_fused(doc.find_all_query(&query));
 }
 
 #[test]
@@ -3198,6 +4792,96 @@ fn typed_selection_delete_and_replace_helpers_work() {
     let delete = doc.try_delete_selection(caret).unwrap();
     assert!(!delete.changed());
     assert_eq!(delete.cursor(), TextPosition::new(0, 3));
+}
+
+#[test]
+fn selection_replace_promotes_partial_piece_table_before_clamping_unresolved_head() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("selection-promote-partial-piece-table.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
+    bytes.push(b'\n');
+    bytes.extend_from_slice(b"tail\n");
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let mut doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let selection = TextSelection::new(TextPosition::new(0, 2), TextPosition::new(2, 4));
+    let cursor = doc.try_replace_selection(selection, "Z").unwrap();
+
+    assert_eq!(cursor, TextPosition::new(0, 3));
+    assert!(!doc.has_piece_table());
+    assert_eq!(doc.text_lossy(), "zeZ\n");
+}
+
+#[test]
+fn selection_edit_capability_requires_promotion_for_unresolved_partial_piece_table_head() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("selection-capability-partial-piece-table.txt");
+    let mut bytes = b"zero\n".to_vec();
+    bytes.extend(std::iter::repeat_n(
+        b'x',
+        PARTIAL_PIECE_TABLE_SCAN_BYTES.saturating_add(32),
+    ));
+    bytes.push(b'\n');
+    bytes.extend_from_slice(b"tail\n");
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = FileStorage::open(&path).unwrap();
+
+    let doc = Document {
+        path: Some(path.clone()),
+        storage: Some(storage.clone()),
+        line_offsets: Arc::new(RwLock::new(LineOffsets::default())),
+        disk_index: None,
+        indexing: Arc::new(AtomicBool::new(false)),
+        indexing_started: None,
+        file_len: bytes.len(),
+        indexed_bytes: Arc::new(AtomicUsize::new(0)),
+        avg_line_len: Arc::new(AtomicUsize::new(AVG_LINE_LEN_ESTIMATE)),
+        line_ending: LineEnding::Lf,
+        encoding: DocumentEncoding::utf8(),
+        encoding_origin: DocumentEncodingOrigin::Utf8FastPath,
+        decoding_had_errors: false,
+        preserve_save_error_cache: Cell::new(None),
+        rope: None,
+        piece_table: Some(PieceTable::new(storage, vec![5], false)),
+        dirty: false,
+    };
+
+    let capability = doc.edit_capability_for_selection(TextSelection::new(
+        TextPosition::new(0, 2),
+        TextPosition::new(2, 4),
+    ));
+
+    assert_eq!(
+        capability,
+        EditCapability::RequiresPromotion {
+            from: DocumentBacking::PieceTable,
+            to: DocumentBacking::Rope,
+        }
+    );
 }
 
 #[test]
@@ -3499,7 +5183,7 @@ fn edit_capability_reports_promotions_and_current_backing() {
 }
 
 #[test]
-fn edit_capability_reports_large_mmap_positions_as_unsupported() {
+fn edit_capability_clamps_large_mmap_positions_to_eof_before_reporting_promotion() {
     let dir = std::env::temp_dir().join(format!("qem-doc-edit-capability-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("huge.bin");
@@ -3513,17 +5197,13 @@ fn edit_capability_reports_large_mmap_positions_as_unsupported() {
 
     assert_eq!(
         capability,
-        EditCapability::Unsupported {
-            backing: DocumentBacking::Mmap,
-            reason:
-                "document is too large to materialize into a rope; editing this region is disabled",
+        EditCapability::RequiresPromotion {
+            from: DocumentBacking::Mmap,
+            to: DocumentBacking::PieceTable,
         }
     );
-    assert!(!capability.is_editable());
-    assert_eq!(
-        capability.reason(),
-        Some("document is too large to materialize into a rope; editing this region is disabled")
-    );
+    assert!(capability.is_editable());
+    assert_eq!(capability.reason(), None);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);

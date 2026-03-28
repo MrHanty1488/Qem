@@ -48,6 +48,14 @@ impl PieceTableSnapshot {
 }
 
 #[derive(Debug, Clone)]
+enum SaveRebaseHint {
+    PieceTable {
+        snapshot_pieces: Vec<Piece>,
+        snapshot_add_len: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
 enum SaveSnapshot {
     Empty,
     Bytes(Vec<u8>),
@@ -72,6 +80,7 @@ pub(crate) struct SaveCompletion {
     pub reload_after_save: bool,
     pub encoding: DocumentEncoding,
     pub encoding_origin: DocumentEncodingOrigin,
+    rebase_hint: Option<SaveRebaseHint>,
 }
 
 impl PreparedSave {
@@ -83,6 +92,13 @@ impl PreparedSave {
     pub(crate) fn execute(self, written: Arc<AtomicU64>) -> Result<SaveCompletion, DocumentError> {
         let path = self.path.clone();
         let total = self.total_bytes;
+        let rebase_hint = match &self.snapshot {
+            SaveSnapshot::PieceTable(piece_table) => Some(SaveRebaseHint::PieceTable {
+                snapshot_pieces: piece_table.pieces.clone(),
+                snapshot_add_len: piece_table.add.len(),
+            }),
+            _ => None,
+        };
         let snapshot = self.snapshot;
         let written_for_io = Arc::clone(&written);
         FileStorage::replace_with(&path, move |file| {
@@ -99,8 +115,118 @@ impl PreparedSave {
             reload_after_save: self.reload_after_save,
             encoding: self.encoding,
             encoding_origin: self.encoding_origin,
+            rebase_hint,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SavedSourceSpan {
+    src: PieceSource,
+    src_start: usize,
+    src_end: usize,
+    saved_start: usize,
+}
+
+fn saved_source_spans(snapshot_pieces: &[Piece]) -> Vec<SavedSourceSpan> {
+    let mut saved_start = 0usize;
+    let mut spans = Vec::with_capacity(snapshot_pieces.len());
+    for piece in snapshot_pieces {
+        spans.push(SavedSourceSpan {
+            src: piece.src,
+            src_start: piece.start,
+            src_end: piece.start.saturating_add(piece.len),
+            saved_start,
+        });
+        saved_start = saved_start.saturating_add(piece.len);
+    }
+    spans
+}
+
+fn next_saved_source_start(spans: &[SavedSourceSpan], src: PieceSource, after: usize) -> Option<usize> {
+    spans
+        .iter()
+        .filter(|span| span.src == src && span.src_start > after)
+        .map(|span| span.src_start)
+        .min()
+}
+
+fn remap_discarded_history_piece(
+    piece: Piece,
+    spans: &[SavedSourceSpan],
+    saved_bytes: &[u8],
+    old_original: &FileStorage,
+    add_bytes: &[u8],
+    rebased_add: &mut Vec<u8>,
+) -> io::Result<Vec<Piece>> {
+    let mut remapped = Vec::new();
+    let piece_end = piece.start.saturating_add(piece.len);
+    let mut cursor = piece.start;
+
+    while cursor < piece_end {
+        if let Some(span) = spans
+            .iter()
+            .find(|span| span.src == piece.src && span.src_start <= cursor && cursor < span.src_end)
+        {
+            let overlap_end = piece_end.min(span.src_end);
+            let saved_start = span
+                .saved_start
+                .saturating_add(cursor.saturating_sub(span.src_start));
+            let len = overlap_end.saturating_sub(cursor);
+            let saved_end = saved_start.saturating_add(len);
+            remapped.push(Piece {
+                src: PieceSource::Original,
+                start: saved_start,
+                len,
+                line_breaks: count_line_breaks_in_bytes(&saved_bytes[saved_start..saved_end]),
+            });
+            cursor = overlap_end;
+            continue;
+        }
+
+        let gap_end = next_saved_source_start(spans, piece.src, cursor)
+            .unwrap_or(piece_end)
+            .min(piece_end);
+        if gap_end <= cursor {
+            return Err(io::Error::other(
+                "discarded save rebase could not advance history remap cursor",
+            ));
+        }
+
+        match piece.src {
+            PieceSource::Original => {
+                let bytes = old_original.read_range(cursor, gap_end);
+                if bytes.len() != gap_end.saturating_sub(cursor) {
+                    return Err(io::Error::other(
+                        "discarded save rebase original slice exceeded source bounds",
+                    ));
+                }
+                let add_start = rebased_add.len();
+                rebased_add.extend_from_slice(bytes);
+                remapped.push(Piece {
+                    src: PieceSource::Add,
+                    start: add_start,
+                    len: bytes.len(),
+                    line_breaks: count_line_breaks_in_bytes(bytes),
+                });
+            }
+            PieceSource::Add => {
+                let bytes = add_bytes.get(cursor..gap_end).ok_or_else(|| {
+                    io::Error::other("discarded save rebase add slice exceeded buffer bounds")
+                })?;
+                remapped.push(Piece {
+                    src: PieceSource::Add,
+                    start: cursor,
+                    len: gap_end.saturating_sub(cursor),
+                    line_breaks: count_line_breaks_in_bytes(bytes),
+                });
+            }
+        }
+
+        cursor = gap_end;
+    }
+
+    Ok(remapped)
 }
 
 fn write_snapshot(
@@ -204,6 +330,68 @@ pub(super) fn clear_session_sidecar(path: &Path) {
 }
 
 impl Document {
+    pub(crate) fn handle_discarded_save_completion(&mut self, completion: &SaveCompletion) {
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        if path != completion.path.as_path() {
+            return;
+        }
+
+        let Some(piece_table) = self.piece_table.as_mut() else {
+            return;
+        };
+        let Some(SaveRebaseHint::PieceTable {
+            snapshot_pieces,
+            snapshot_add_len: _snapshot_add_len,
+        }) = completion.rebase_hint.as_ref()
+        else {
+            return;
+        };
+
+        let new_storage = match FileStorage::open(path) {
+            Ok(storage) => storage,
+            Err(_) => {
+                piece_table.pieces.detach_persistence();
+                clear_session_sidecar(path);
+                return;
+            }
+        };
+        let saved_storage = new_storage.clone();
+        let saved_bytes = saved_storage.read_range(0, saved_storage.len());
+        let spans = saved_source_spans(snapshot_pieces);
+        let old_original = piece_table.original.clone();
+        let add_bytes = piece_table.add.clone();
+        let mut rebased_add = add_bytes.clone();
+        let session_meta = piece_table.session_meta();
+        let remap_result = piece_table.pieces.rebuild_history_roots_disk(path, |piece| {
+            remap_discarded_history_piece(
+                piece,
+                &spans,
+                saved_bytes,
+                &old_original,
+                &add_bytes,
+                &mut rebased_add,
+            )
+        });
+        let Ok(mut rebuilt_pieces) = remap_result else {
+            piece_table.pieces.detach_persistence();
+            clear_session_sidecar(path);
+            return;
+        };
+        if rebuilt_pieces.flush_session(&rebased_add, session_meta).is_err() {
+            piece_table.pieces.detach_persistence();
+            clear_session_sidecar(path);
+            return;
+        }
+        piece_table.pieces = rebuilt_pieces;
+        piece_table.original = new_storage;
+        piece_table.add = rebased_add;
+        piece_table.pending_session_flush = false;
+        piece_table.pending_session_edits = 0;
+        piece_table.last_session_flush = Some(Instant::now());
+    }
+
     fn rendered_text_for_save(&self) -> String {
         if let Some(rope) = &self.rope {
             return rope_text_with_line_endings(rope, self.line_ending);
@@ -415,6 +603,19 @@ impl Document {
         };
 
         let reload_after_save = !self.has_edit_buffer() || self.has_piece_table();
+        if reload_after_save
+            && !encoding.is_utf8()
+            && total_bytes > MAX_ROPE_EDIT_FILE_BYTES as u64
+        {
+            return Err(save_encoding_error(
+                path,
+                "save",
+                encoding,
+                DocumentEncodingErrorKind::SaveReopenTooLarge {
+                    max_bytes: MAX_ROPE_EDIT_FILE_BYTES,
+                },
+            ));
+        }
 
         Ok(PreparedSave {
             path: path.to_path_buf(),
@@ -452,11 +653,27 @@ impl Document {
             return Ok(());
         }
 
-        if let Some(old_path) = previous_path.as_deref() {
-            clear_session_sidecar(old_path);
-        }
+        let same_path_sidecar_backup = previous_path
+            .as_deref()
+            .filter(|old_path| *old_path == path.as_path())
+            .and_then(|old_path| std::fs::read(editlog_path(old_path)).ok());
         clear_session_sidecar(&path);
-        *self = Self::reopen_with_encoding_contract(path, encoding, encoding_origin)?;
+        let reopen_path = path.clone();
+        let reopened = match Self::reopen_with_encoding_contract(reopen_path, encoding, encoding_origin) {
+            Ok(doc) => doc,
+            Err(err) => {
+                if let Some(sidecar_bytes) = same_path_sidecar_backup {
+                    let _ = std::fs::write(editlog_path(&path), sidecar_bytes);
+                }
+                return Err(err);
+            }
+        };
+        if let Some(old_path) = previous_path.as_deref() {
+            if old_path != path.as_path() {
+                clear_session_sidecar(old_path);
+            }
+        }
+        *self = reopened;
         Ok(())
     }
 

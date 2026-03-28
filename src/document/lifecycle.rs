@@ -721,6 +721,23 @@ impl Document {
         self.path = Some(path);
     }
 
+    pub(crate) fn can_skip_clean_preserve_save_to_path(&self, path: &Path) -> bool {
+        if self.dirty || self.path.as_deref() != Some(path) || !path.exists() {
+            return false;
+        }
+
+        let Some(backing) = self
+            .piece_table
+            .as_ref()
+            .map(|piece_table| &piece_table.original)
+            .or(self.storage.as_ref())
+        else {
+            return false;
+        };
+
+        backing.path() == path && backing.matches_live_file_contents().unwrap_or(false)
+    }
+
     /// Returns `true` if the document has unsaved changes.
     pub fn is_dirty(&self) -> bool {
         self.dirty

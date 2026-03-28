@@ -1,3 +1,4 @@
+use crate::source_identity::{sampled_content_fingerprint, sampled_file_fingerprint};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -176,6 +177,15 @@ impl FileStorage {
     pub fn write_all(&self, data: &[u8]) -> io::Result<Self> {
         replace_file_contents(self.path(), data)?;
         Self::open(self.path()).map_err(StorageOpenError::into_io_error)
+    }
+
+    pub fn matches_live_file_contents(&self) -> io::Result<bool> {
+        let metadata = fs::metadata(self.path())?;
+        if metadata.len() as usize != self.len() {
+            return Ok(false);
+        }
+
+        Ok(sampled_file_fingerprint(self.path())? == sampled_content_fingerprint(self.bytes()))
     }
 
     pub(crate) fn replace_with(

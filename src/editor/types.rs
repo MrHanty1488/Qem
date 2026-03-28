@@ -152,9 +152,9 @@ impl FileProgress {
     /// Returns completion as a `0.0..=1.0` fraction.
     pub fn fraction(&self) -> f32 {
         if self.total_bytes == 0 {
-            0.0
+            1.0
         } else {
-            self.completed_bytes as f32 / self.total_bytes as f32
+            self.completed_bytes.min(self.total_bytes) as f32 / self.total_bytes as f32
         }
     }
 }

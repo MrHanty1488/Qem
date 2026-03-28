@@ -1,6 +1,174 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug)]
+struct PieceTableScanRange {
+    range: (usize, usize),
+    exact: bool,
+}
+
+fn next_piece_table_scan_line_range(
+    bytes: &[u8],
+    start0: usize,
+    buffer_reaches_eof: bool,
+) -> Option<PieceTableScanRange> {
+    if start0 >= bytes.len() {
+        return None;
+    }
+
+    let slice = &bytes[start0..];
+    let end0 = if let Some(rel) = memchr::memchr2(b'\n', b'\r', slice) {
+        let idx = start0 + rel;
+        if bytes[idx] == b'\r' && idx + 1 < bytes.len() && bytes[idx + 1] == b'\n' {
+            idx + 2
+        } else {
+            idx + 1
+        }
+    } else {
+        bytes.len()
+    };
+
+    Some(PieceTableScanRange {
+        range: (start0, end0.max(start0)),
+        exact: end0 < bytes.len() || buffer_reaches_eof,
+    })
+}
+
+fn count_text_units_in_bytes(bytes: &[u8]) -> usize {
+    let mut units = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' => {
+                units = units.saturating_add(1);
+                i += 1;
+                if i < bytes.len() && bytes[i] == b'\n' {
+                    i += 1;
+                }
+            }
+            b'\n' => {
+                units = units.saturating_add(1);
+                i += 1;
+            }
+            _ => {
+                units = units.saturating_add(1);
+                i += utf8_step(bytes, i, bytes.len());
+            }
+        }
+    }
+    units
+}
+
+fn safe_piece_table_offset_for_position(piece_table: &PieceTable, position: TextPosition) -> usize {
+    Document::scanned_piece_table_offset_for_position(piece_table, position)
+        .map(|(offset, _)| offset)
+        .unwrap_or_else(|| piece_table.known_byte_len.min(piece_table.total_len()))
+}
+
 impl Document {
+    pub(crate) fn piece_table_position_is_representable(
+        piece_table: &PieceTable,
+        position: TextPosition,
+    ) -> bool {
+        if piece_table.full_index() || piece_table.has_line(position.line0()) {
+            return true;
+        }
+
+        let Some(scanned) = Self::scanned_piece_table_line_range(piece_table, position.line0()) else {
+            return false;
+        };
+        let bytes = piece_table.read_range(scanned.range.0, scanned.range.1);
+        let mut end = bytes.len();
+        while end > 0 {
+            let b = bytes[end - 1];
+            if b == b'\n' || b == b'\r' {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+
+        let line_len = if scanned.exact {
+            count_text_columns_exact(&bytes[..end])
+        } else {
+            count_text_columns(&bytes[..end], MAX_LINE_SCAN_CHARS)
+        };
+        position.col0() <= line_len
+    }
+
+    pub(super) fn selection_requires_piece_table_promotion(
+        &self,
+        selection: TextSelection,
+    ) -> bool {
+        let Some(piece_table) = &self.piece_table else {
+            return false;
+        };
+        if piece_table.full_index() {
+            return false;
+        }
+
+        !Self::piece_table_position_is_representable(piece_table, selection.anchor())
+            || !Self::piece_table_position_is_representable(piece_table, selection.head())
+    }
+
+    fn scanned_piece_table_line_range(
+        piece_table: &PieceTable,
+        line0: usize,
+    ) -> Option<PieceTableScanRange> {
+        if piece_table.full_index() || piece_table.has_line(line0) {
+            return Some(PieceTableScanRange {
+                range: piece_table.line_range(line0),
+                exact: true,
+            });
+        }
+
+        let scan_start = piece_table.known_byte_len.min(piece_table.total_len());
+        let scan_end = scan_start
+            .saturating_add(PARTIAL_PIECE_TABLE_SCAN_BYTES)
+            .min(piece_table.total_len());
+        if scan_start >= scan_end {
+            return None;
+        }
+
+        let bytes = piece_table.read_range(scan_start, scan_end);
+        let buffer_reaches_eof = scan_end == piece_table.total_len();
+        let mut rel_start = 0usize;
+        let mut skip_lines = line0.saturating_sub(piece_table.line_count());
+        while skip_lines > 0 {
+            let scanned = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
+            if scanned.range.1 <= rel_start || !scanned.exact {
+                return None;
+            }
+            rel_start = scanned.range.1;
+            skip_lines -= 1;
+        }
+
+        let scanned = next_piece_table_scan_line_range(&bytes, rel_start, buffer_reaches_eof)?;
+        Some(PieceTableScanRange {
+            range: (
+                scan_start.saturating_add(scanned.range.0),
+                scan_start.saturating_add(scanned.range.1),
+            ),
+            exact: scanned.exact,
+        })
+    }
+
+    fn scanned_piece_table_offset_for_position(
+        piece_table: &PieceTable,
+        position: TextPosition,
+    ) -> Option<(usize, bool)> {
+        let scanned = Self::scanned_piece_table_line_range(piece_table, position.line0())?;
+        let bytes = piece_table.read_range(scanned.range.0, scanned.range.1);
+        let offset = byte_offset_for_text_col_in_bytes(
+            &bytes,
+            (0, bytes.len()),
+            position.col0(),
+        );
+        Some((
+            scanned.range.0.saturating_add(offset),
+            Self::piece_table_position_is_representable(piece_table, position),
+        ))
+    }
+
     /// Returns the line length in document text columns, excluding any trailing
     /// line ending.
     ///
@@ -11,29 +179,39 @@ impl Document {
             if piece_table.full_index() || piece_table.has_line(line0) {
                 return piece_table.line_len_chars(line0);
             }
+            if let Some(scanned) = Self::scanned_piece_table_line_range(piece_table, line0) {
+                let bytes = piece_table.read_range(scanned.range.0, scanned.range.1);
+                let mut end = bytes.len();
+                while end > 0 {
+                    let b = bytes[end - 1];
+                    if b == b'\n' || b == b'\r' {
+                        end -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                return if scanned.exact {
+                    count_text_columns_exact(&bytes[..end])
+                } else {
+                    count_text_columns(&bytes[..end], MAX_LINE_SCAN_CHARS)
+                };
+            }
+            return 0;
         }
         if let Some(rope) = &self.rope {
             return Self::rope_line_len_chars_without_newline(rope, line0);
         }
 
         let bytes = self.mmap_bytes();
-        let exact_range = self
-            .line_offsets
-            .read()
-            .ok()
-            .and_then(|offsets| {
-                let start0 = offsets.get_usize(line0)?;
-                let end0 = offsets
-                    .get_usize(line0 + 1)
-                    .or_else(|| (self.indexed_bytes() >= self.file_len).then_some(self.file_len))?;
-                Some((start0, end0))
-            })
-            .or_else(|| self.estimated_mmap_line_byte_range(line0));
-        let Some((start0, end0)) = exact_range else {
+        let file_len = self.file_len.min(bytes.len());
+        if file_len == 0 {
+            return 0;
+        }
+
+        let Some(start) = self.mmap_line_start_offset_exact(line0) else {
             return 0;
         };
-        let start = start0.min(bytes.len());
-        let mut end = end0.min(bytes.len());
+        let mut end = super::search::next_line_start_exact(bytes, file_len, start).min(file_len);
         while end > start {
             let b = bytes[end - 1];
             if b == b'\n' || b == b'\r' {
@@ -42,13 +220,36 @@ impl Document {
                 break;
             }
         }
-        count_text_columns(&bytes[start..end], MAX_LINE_SCAN_CHARS)
+        count_text_columns_exact(&bytes[start..end])
     }
 
     /// Clamps a typed position into the currently known document bounds.
     pub fn clamp_position(&self, position: TextPosition) -> TextPosition {
-        let total_lines = self.display_line_count().max(1);
-        let line0 = position.line0().min(total_lines.saturating_sub(1));
+        let line0 = if self.rope.is_some() {
+            position
+                .line0()
+                .min(self.display_line_count().max(1).saturating_sub(1))
+        } else if let Some(piece_table) = &self.piece_table {
+            if piece_table.full_index()
+                || piece_table.has_line(position.line0())
+                || Self::scanned_piece_table_line_range(piece_table, position.line0()).is_some()
+            {
+                position.line0()
+            } else {
+                position
+                    .line0()
+                    .min(self.display_line_count().max(1).saturating_sub(1))
+            }
+        } else {
+            let bytes = self.mmap_bytes();
+            let file_len = self.file_len.min(bytes.len());
+            let eof_position = self.mmap_position_for_byte_offset(file_len);
+            if self.mmap_line_start_offset_exact(position.line0()).is_some() {
+                position.line0()
+            } else {
+                eof_position.line0()
+            }
+        };
         let col0 = position.col0().min(self.line_len_chars(line0));
         TextPosition::new(line0, col0)
     }
@@ -98,7 +299,14 @@ impl Document {
         if let Some(rope) = &self.rope {
             return Self::line_col_to_char_index(rope, position.line0(), position.col0());
         }
-        self.text_units_between(TextPosition::new(0, 0), position)
+        if let Some(piece_table) = &self.piece_table {
+            let offset = safe_piece_table_offset_for_position(piece_table, position);
+            return count_text_units_in_bytes(&piece_table.read_range(0, offset));
+        }
+        let bytes = self.mmap_bytes();
+        let file_len = self.file_len.min(bytes.len());
+        let offset = self.mmap_byte_offset_for_position(position).min(file_len);
+        count_text_units_in_bytes(&bytes[..offset])
     }
 
     /// Returns the number of edit text units between two typed positions.
@@ -117,22 +325,19 @@ impl Document {
             let end_idx = Self::line_col_to_char_index(rope, end.line0(), end.col0());
             return end_idx.saturating_sub(start_idx);
         }
-
-        if start.line0() == end.line0() {
-            return end.col0().saturating_sub(start.col0());
+        if let Some(piece_table) = &self.piece_table {
+            let start_offset = safe_piece_table_offset_for_position(piece_table, start);
+            let end_offset = safe_piece_table_offset_for_position(piece_table, end);
+            return count_text_units_in_bytes(
+                &piece_table.read_range(start_offset.min(end_offset), end_offset.max(start_offset)),
+            );
         }
 
-        let mut units = self
-            .line_len_chars(start.line0())
-            .saturating_sub(start.col0());
-        for line0 in start.line0()..end.line0() {
-            units = units.saturating_add(1);
-            if line0 + 1 == end.line0() {
-                break;
-            }
-            units = units.saturating_add(self.line_len_chars(line0 + 1));
-        }
-        units.saturating_add(end.col0())
+        let bytes = self.mmap_bytes();
+        let file_len = self.file_len.min(bytes.len());
+        let start_offset = self.mmap_byte_offset_for_position(start).min(file_len);
+        let end_offset = self.mmap_byte_offset_for_position(end).min(file_len);
+        count_text_units_in_bytes(&bytes[start_offset.min(end_offset)..end_offset.max(start_offset)])
     }
 
     /// Builds a typed edit range between two positions.
@@ -213,6 +418,25 @@ impl Document {
 
     /// Returns the editability for an anchor/head selection.
     pub fn edit_capability_for_selection(&self, selection: TextSelection) -> EditCapability {
+        if self.selection_requires_piece_table_promotion(selection) {
+            let total_len = self
+                .piece_table
+                .as_ref()
+                .map(|piece_table| piece_table.total_len())
+                .unwrap_or(self.file_len);
+            return if self.can_materialize_rope(total_len) {
+                EditCapability::RequiresPromotion {
+                    from: DocumentBacking::PieceTable,
+                    to: DocumentBacking::Rope,
+                }
+            } else {
+                EditCapability::Unsupported {
+                    backing: DocumentBacking::PieceTable,
+                    reason:
+                        "document is too large to widen partial piece-table editing beyond the indexed prefix",
+                }
+            };
+        }
         let range = self.text_range_for_selection(selection);
         self.edit_capability_for_range(range)
     }
