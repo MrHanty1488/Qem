@@ -1941,10 +1941,14 @@ fn coalesce_adjacent(pieces: &mut Vec<Piece>) {
     let mut out: Vec<Piece> = Vec::with_capacity(pieces.len());
     for piece in pieces.drain(..) {
         if let Some(last) = out.last_mut() {
-            let merge_original =
-                last.src == PieceSource::Original && last.line_breaks == 0 && piece.line_breaks == 0;
+            let merge_original = last.src == PieceSource::Original
+                && last.line_breaks == 0
+                && piece.line_breaks == 0;
             let merge_add = last.src == PieceSource::Add;
-            if last.src == piece.src && last.start + last.len == piece.start && (merge_original || merge_add) {
+            if last.src == piece.src
+                && last.start + last.len == piece.start
+                && (merge_original || merge_add)
+            {
                 last.len = last.len.saturating_add(piece.len);
                 last.line_breaks = last.line_breaks.saturating_add(piece.line_breaks);
                 continue;

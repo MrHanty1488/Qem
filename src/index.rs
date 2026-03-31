@@ -20,6 +20,7 @@ const INDEX_PAGE_HEADER_BYTES: usize = 16;
 const INDEX_ENTRY_BYTES: usize = 24;
 const INDEX_CACHE_PAGES: usize = 32;
 const INDEX_BUILD_MIN_FILE_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+#[cfg(windows)]
 const INDEX_SYNC_BUILD_MAX_SCAN_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 const INDEX_CHECKPOINT_STRIDE_LINES: u64 = 8_192;
 const INDEX_CHECKPOINT_STRIDE_BYTES: u64 = 1_048_576; // 1 MiB
@@ -459,14 +460,14 @@ fn build_index_file(
     })
 }
 
-fn scannable_ranges(source_path: &Path, file_len: usize) -> Vec<(usize, usize)> {
+fn scannable_ranges(_source_path: &Path, file_len: usize) -> Vec<(usize, usize)> {
     if file_len == 0 {
         return Vec::new();
     }
 
     #[cfg(windows)]
     {
-        if let Ok(ranges) = windows_allocated_ranges(source_path, file_len) {
+        if let Ok(ranges) = windows_allocated_ranges(_source_path, file_len) {
             return ranges;
         }
     }
@@ -474,20 +475,21 @@ fn scannable_ranges(source_path: &Path, file_len: usize) -> Vec<(usize, usize)> 
     vec![(0, file_len)]
 }
 
+#[cfg(windows)]
 fn total_scannable_bytes(ranges: &[(usize, usize)]) -> usize {
-    ranges
-        .iter()
-        .fold(0usize, |acc, (start, end)| acc.saturating_add(end.saturating_sub(*start)))
+    ranges.iter().fold(0usize, |acc, (start, end)| {
+        acc.saturating_add(end.saturating_sub(*start))
+    })
 }
 
-fn should_build_index_synchronously(source_path: &Path, file_len: usize) -> bool {
+fn should_build_index_synchronously(_source_path: &Path, file_len: usize) -> bool {
     if file_len == 0 {
         return true;
     }
 
     #[cfg(windows)]
     {
-        if let Ok(ranges) = windows_allocated_ranges(source_path, file_len) {
+        if let Ok(ranges) = windows_allocated_ranges(_source_path, file_len) {
             return total_scannable_bytes(&ranges) <= INDEX_SYNC_BUILD_MAX_SCAN_BYTES;
         }
     }
@@ -495,7 +497,11 @@ fn should_build_index_synchronously(source_path: &Path, file_len: usize) -> bool
     false
 }
 
-fn merge_contiguous_ranges(mut ranges: Vec<(usize, usize)>, file_len: usize) -> Vec<(usize, usize)> {
+#[cfg(any(windows, test))]
+fn merge_contiguous_ranges(
+    mut ranges: Vec<(usize, usize)>,
+    file_len: usize,
+) -> Vec<(usize, usize)> {
     if ranges.is_empty() {
         return ranges;
     }
@@ -521,7 +527,10 @@ fn merge_contiguous_ranges(mut ranges: Vec<(usize, usize)>, file_len: usize) -> 
 }
 
 #[cfg(windows)]
-fn windows_allocated_ranges(source_path: &Path, file_len: usize) -> io::Result<Vec<(usize, usize)>> {
+fn windows_allocated_ranges(
+    source_path: &Path,
+    file_len: usize,
+) -> io::Result<Vec<(usize, usize)>> {
     use std::ffi::c_void;
     use std::os::windows::io::AsRawHandle;
     use std::ptr;
@@ -558,7 +567,9 @@ fn windows_allocated_ranges(source_path: &Path, file_len: usize) -> io::Result<V
             DeviceIoControl(
                 handle,
                 FSCTL_QUERY_ALLOCATED_RANGES,
-                (&query as *const FileAllocatedRangeBuffer).cast_mut().cast::<c_void>(),
+                (&query as *const FileAllocatedRangeBuffer)
+                    .cast_mut()
+                    .cast::<c_void>(),
                 entry_size as u32,
                 output.as_mut_ptr().cast::<c_void>(),
                 output
@@ -763,8 +774,7 @@ fn source_metadata(path: &Path, bytes: &[u8]) -> io::Result<IndexMetadata> {
 mod tests {
     use super::{
         build_index_file, build_or_open_index, merge_contiguous_ranges, sidecar_path,
-        source_metadata, FileHeader,
-        ReadyDiskLineIndex,
+        source_metadata, FileHeader, ReadyDiskLineIndex,
     };
     use crate::storage::FileStorage;
     use std::fs;

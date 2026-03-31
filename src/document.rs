@@ -1018,7 +1018,8 @@ impl PieceTable {
             pieces,
             known_line_count,
             exact_base_line_breaks: Some(known_line_count.saturating_sub(1)),
-            exact_base_total_lines: exact_base_total_lines.or(full_index.then_some(known_line_count)),
+            exact_base_total_lines: exact_base_total_lines
+                .or(full_index.then_some(known_line_count)),
             known_byte_len,
             total_len,
             full_index,
@@ -1047,7 +1048,9 @@ impl PieceTable {
             add,
             pieces,
             known_line_count,
-            exact_base_line_breaks: meta.full_index.then_some(known_line_count.saturating_sub(1)),
+            exact_base_line_breaks: meta
+                .full_index
+                .then_some(known_line_count.saturating_sub(1)),
             exact_base_total_lines: meta.full_index.then_some(known_line_count),
             known_byte_len,
             total_len,
@@ -1088,9 +1091,17 @@ impl PieceTable {
         let base_total_lines = self.exact_base_total_lines.or(fallback_total_lines)?.max(1);
         let current_breaks = self.pieces.total_line_breaks();
         if current_breaks >= base_breaks {
-            Some(base_total_lines.saturating_add(current_breaks - base_breaks).max(1))
+            Some(
+                base_total_lines
+                    .saturating_add(current_breaks - base_breaks)
+                    .max(1),
+            )
         } else {
-            Some(base_total_lines.saturating_sub(base_breaks - current_breaks).max(1))
+            Some(
+                base_total_lines
+                    .saturating_sub(base_breaks - current_breaks)
+                    .max(1),
+            )
         }
     }
 
@@ -1239,9 +1250,10 @@ impl PieceTable {
 
         let mut out = Vec::with_capacity(max_cols.min(4096).saturating_mul(4));
         let mut cols = 0usize;
-        let _ = self
-            .pieces
-            .visit_range_while(start, self.known_byte_len, |piece, local_start, local_end| {
+        let _ = self.pieces.visit_range_while(
+            start,
+            self.known_byte_len,
+            |piece, local_start, local_end| {
                 if cols >= max_cols {
                     return false;
                 }
@@ -1266,7 +1278,8 @@ impl PieceTable {
                 }
 
                 true
-            });
+            },
+        );
 
         String::from_utf8(out)
             .unwrap_or_else(|err| String::from_utf8_lossy(&err.into_bytes()).into_owned())
